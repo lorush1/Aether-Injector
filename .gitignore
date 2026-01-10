@@ -1,0 +1,23 @@
+# Compiled binaries
+*.o
+*.so
+*.so.*
+ae_daemon
+ae_injector
+
+# Build artifacts
+*.exe
+*.dll
+*.a
+*.lib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

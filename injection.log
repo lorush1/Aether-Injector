@@ -1,0 +1,25 @@
+
+    ___          __  __                
+   /   | ___  __/ /_/ /_  ___  _____  
+  / /| |/ _ \/ __/ __ \/ _ \/ ___/  
+ / ___ /  __/ /_/ / / /  __/ /      
+/_/  |_\___/\__/_/ /_/\___/_/       
+                                      
+   Aether-Injector v1.0               
+   Memory-Only Process Injection      
+
+[2026-01-10 03:22:56] [ERROR] -m option is required (module path)
+[2026-01-10 03:22:56] [INFO] 
+Usage: ./ae_injector -t <pid> -m <module> -f <function> [opts]
+[2026-01-10 03:22:56] [INFO] 
+Required Arguments:
+[2026-01-10 03:22:56] [INFO]   -t <pid>       Target process ID
+[2026-01-10 03:22:56] [INFO]   -m <module>    Path to shared object (.so) to inject
+[2026-01-10 03:22:56] [INFO]   -f <function>  Function name to hijack in target process
+[2026-01-10 03:22:56] [INFO] 
+Optional Arguments:
+[2026-01-10 03:22:56] [INFO]   -s             Stealth mode (memory-only injection, reduced logging)
+[2026-01-10 03:22:56] [INFO] 
+Examples:
+[2026-01-10 03:22:56] [INFO]   ./ae_injector -t 1234 -m ae_parasite.so.1.0 -f printf
+[2026-01-10 03:22:56] [INFO]   ./ae_injector -t 5678 -m ae_parasite.so.1.0 -f malloc -s

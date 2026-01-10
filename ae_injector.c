@@ -87,6 +87,7 @@ static bool ae_stealth_mode = false;
 static int ae_is_address_mapped(int pid, ulong_t addr, size_t size);
 static int ae_ensure_stopped(int pid);
 static ulong_t ae_find_sysenter(int pid, ulong_t start, ulong_t end, size_t max_search_size, size_t chunk_size);
+static void ae_show_progress_bar(ulong_t current, ulong_t total, const char * status, int done);
 static inline void ae_ptrace_cpy_from(ulong_t * dst, ulong_t src, size_t size, int pid);
 static inline void ae_ptrace_cpy_to(ulong_t dst, ulong_t * src, size_t size, int pid);
 
@@ -149,6 +150,48 @@ static int ae_ensure_stopped(int pid) {
 }
 
 /* --- End helper implementations --- */
+static void
+ae_show_progress_bar (ulong_t current,
+		      ulong_t total,
+		      const char * status,
+		      int done)
+{
+	static int use_tty = -1;
+
+	/* Skip progress output in stealth mode */
+	if (ae_stealth_mode)
+		return;
+
+	if (use_tty == -1)
+		use_tty = isatty(fileno(stderr));
+	if (!use_tty)
+		return;
+
+	if (total == 0)
+		total = 1;
+	if (current > total)
+		current = total;
+
+	unsigned long percent = (current * 100UL) / total;
+	const int bar_width = 40;
+	int filled = (int)((percent * bar_width) / 100UL);
+
+	/* Carriage return and clear line for single-line updates */
+	fprintf(stderr, "\r\033[K[");
+	for (int i = 0; i < bar_width; i++) {
+		if (i < filled)
+			fputc('=', stderr);
+		else if (i == filled)
+			fputc('>', stderr);
+		else
+			fputc(' ', stderr);
+	}
+	fprintf(stderr, "] %3lu%% %s", percent, status ? status : "");
+	if (done)
+		fputc('\n', stderr);
+	fflush(stderr);
+}
+
 static inline void ae_ptrace_cpy_to(ulong_t dst, ulong_t * src, size_t size, int pid);
 
 // includes byte-based signatures of our evil function and
@@ -495,8 +538,11 @@ ae_find_sysenter (int pid,
 		return 0;
 
 	ulong_t total = limit - start;
-	ulong_t next_log = 0x1000;
 	ulong_t bytes_searched = 0;
+	const char *progress_status = "Searching for sysenter...";
+
+	if (!ae_stealth_mode)
+		ae_show_progress_bar(0, total, progress_status, 0);
 
 	for (ulong_t addr = start; addr < limit && !found; addr += chunk_size) {
 		size_t remaining = (size_t)(limit - addr);
@@ -513,6 +559,10 @@ ae_find_sysenter (int pid,
 					found = addr + i;
 					if (found >= 5)
 						found -= 5;
+					if (!ae_stealth_mode) {
+						ae_show_progress_bar(bytes_searched, total, "Sysenter found!", 0);
+						ae_show_progress_bar(total, total, "Sysenter found!", 1);
+					}
 					break;
 				}
 			}
@@ -522,13 +572,12 @@ ae_find_sysenter (int pid,
 			continue;
 		}
 
-		if (!ae_stealth_mode && total >= 0x1000 && bytes_searched >= next_log) {
-			ulong_t percent = (bytes_searched * 100) / total;
-			ae_log(AE_LOG_DEBUG, "Searching for sysenter: %lu/%lu bytes (%lu%%)",
-			       (unsigned long)bytes_searched, (unsigned long)total, (unsigned long)percent);
-			next_log += 0x1000;
-		}
+		if (!ae_stealth_mode)
+			ae_show_progress_bar(bytes_searched, total, progress_status, 0);
 	}
+
+	if (!found && !ae_stealth_mode)
+		ae_show_progress_bar(bytes_searched, total, "Sysenter not found", 1);
 
 	return found;
 }

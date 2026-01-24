@@ -6,7 +6,9 @@
 #include <stdarg.h>
 #include <unistd.h>
 
-/* Log levels */
+// logging system with colors and timestamps because why not
+// look at this clean code just look at it
+
 typedef enum {
     AE_LOG_SUCCESS = 0,
     AE_LOG_INFO = 1,
@@ -16,7 +18,7 @@ typedef enum {
     AE_LOG_DEBUG = 5
 } ae_log_level_t;
 
-/* ANSI color codes */
+// ansi color codes for pretty output
 #define AE_COLOR_GREEN   "\033[1;32m"
 #define AE_COLOR_CYAN    "\033[1;36m"
 #define AE_COLOR_YELLOW  "\033[1;33m"
@@ -25,11 +27,11 @@ typedef enum {
 #define AE_COLOR_BLUE    "\033[1;34m"
 #define AE_COLOR_RESET   "\033[0m"
 
-/* Get level string and color */
+// gets the tag string and color for a log level
+// checks if stderr is a tty to decide if we should use colors
 static inline void ae_get_level_info(ae_log_level_t level, const char **tag, const char **color) {
     static int use_color = -1;
     
-    /* Determine if we should use colors (only on first call) */
     if (use_color == -1) {
         use_color = isatty(fileno(stderr));
     }
@@ -66,7 +68,8 @@ static inline void ae_get_level_info(ae_log_level_t level, const char **tag, con
     }
 }
 
-/* Main logging function */
+// ship it no notes
+// main logging function prints timestamp level tag and message with colors if tty
 static inline void ae_log(ae_log_level_t level, const char *fmt, ...) {
     char timestamp[64];
     time_t now;
@@ -76,7 +79,6 @@ static inline void ae_log(ae_log_level_t level, const char *fmt, ...) {
     const char *reset = "";
     static int use_color = -1;
     
-    /* Determine if we should use colors */
     if (use_color == -1) {
         use_color = isatty(fileno(stderr));
     }
@@ -85,18 +87,14 @@ static inline void ae_log(ae_log_level_t level, const char *fmt, ...) {
         reset = AE_COLOR_RESET;
     }
     
-    /* Get current time */
     time(&now);
     tm_info = localtime(&now);
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
     
-    /* Get level info */
     ae_get_level_info(level, &tag, &color);
     
-    /* Print timestamp and level tag */
     fprintf(stderr, "[%s] %s%s%s ", timestamp, color, tag, reset);
     
-    /* Print the actual message */
     va_list args;
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);
@@ -105,5 +103,4 @@ static inline void ae_log(ae_log_level_t level, const char *fmt, ...) {
     fprintf(stderr, "\n");
 }
 
-#endif /* AE_LOG_H */
-
+#endif

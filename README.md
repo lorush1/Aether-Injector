@@ -1,6 +1,6 @@
 # Aether Injector 
 
-Heyoooo so this is aether injector, basically a process injection tool that lets you inject code into running processes on linux. it's pretty fucking cool if i do say so myself.
+Heyoooo so this is aether injector, basically a process injection tool that lets you inject code into running processes on linux. it's pretty cool if i do say so myself.
 
 ## what is this exactly?
 
@@ -20,7 +20,7 @@ the codee is C based and its fairly long soo have fun ¯\\_(ツ)_/¯
 
 ## building this thing
 
-just run make, it's not rocket science:
+just run make:
 
 ```bash
 make
@@ -49,28 +49,28 @@ make
 ./ae_daemon
 ```
 
-it'll print its PID, remember that shit.
+it'll print its PID, remember that shit I spent 2h tryna debug it once turns out just didnt write the PID right.
 
 ### step 3: inject into it
 ```bash
-./ae_injector -p <PID> -f printf -l ae_parasite.so.1.0
+./ae_injector -t <PID> -m ae_parasite.so.1.0 -f printf
 ```
 
 where:
-- `-p` is the process ID you wanna inject into
+- `-t` is the process ID you wanna inject into
+- `-m` is the path to the shared object (.so) to inject
 - `-f` is the function you wanna hijack (like `printf`)
-- `-l` is the library name
 
 ### step 4: watch the magic happen
 
-the daemon's `printf` calls will now print "I am evil!" instead of whatever it was supposed to print. pretty neat right?
+the daemon's `printf` calls will now print "I am evil!" instead of whatever it was supposed to print. (And its only rlly evil if u use it incorrectly or on stuff which isnt ur own, I dont take any responsibility for that)
 
 ## stealth mode
 
 you can also use stealth mode if you wanna be sneaky about it:
 
 ```bash
-./ae_injector -p <PID> -f printf -l ae_parasite.so.1.0 -s
+./ae_injector -t <PID> -m ae_parasite.so.1.0 -f printf -s
 ```
 
 the `-s` flag enables stealth mode which tries to hide the injection better. use it wisely.
@@ -107,4 +107,4 @@ Personally this is just a portfolio piece for me and my first ever kinda big C p
 
 ## credits
 -Lora Vega (me) / FaultLine
-made with way too much coffee and probably too little sleep. enjoy! <3
+made with way too much energy (im hyperactive and a yapper makes sense tbh) and probably too little sleep. enjoy! <3

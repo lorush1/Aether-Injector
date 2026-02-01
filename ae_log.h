@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 // logging system with colors and timestamps because why not
-// look at this clean code just look at it
+// it is pretty
 
 typedef enum {
     AE_LOG_SUCCESS = 0,

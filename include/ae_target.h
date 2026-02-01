@@ -20,6 +20,28 @@ typedef struct {
     char path[256];
 } ae_target_mapping_t;
 
+/* Architecture-specific register structure */
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+typedef struct {
+    uintptr_t rax;
+    uintptr_t rbx;
+    uintptr_t rcx;
+    uintptr_t rdx;
+    uintptr_t rsi;
+    uintptr_t rdi;
+    uintptr_t rsp;
+    uintptr_t rbp;
+    uintptr_t r8;
+    uintptr_t r9;
+    uintptr_t r10;
+    uintptr_t r11;
+    uintptr_t r12;
+    uintptr_t r13;
+    uintptr_t r14;
+    uintptr_t r15;
+    uintptr_t rip;
+} ae_target_regs_t;
+#else
 typedef struct {
     uintptr_t eax;
     uintptr_t ebx;
@@ -31,6 +53,7 @@ typedef struct {
     uintptr_t ebp;
     uintptr_t eip;
 } ae_target_regs_t;
+#endif
 
 ae_status_t ae_target_create(ae_target_t* out_target, pid_t pid, ae_target_backend_t backend);
 ae_status_t ae_target_destroy(ae_target_t target);

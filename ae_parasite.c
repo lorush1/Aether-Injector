@@ -3,13 +3,29 @@
 #include <stdarg.h>
 #include "ae_log.h"
 
-// evil function that replaces printf or whatever we hijack
-// this gets injected into target process and replaces the original function
+/* evil function that replaces printf or whatever we hijack */
 
 int ae_evilprint (const char *format, ...);
 
-// write syscall using inline asm because why not
-// does write syscall directly with int 0x80 saves ebx first then restores it
+
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+/* 64-bit: does write syscall directly with syscall instruction
+ * Convention: rax=syscall num, rdi=fd, rsi=buf, rdx=count */
+static long
+ae_write (int fd, void *buf, long count)
+{
+	long ret;
+
+	__asm__ __volatile__ (
+		"syscall"
+		: "=a" (ret)
+		: "0" ((long)SYS_write), "D" ((long)fd), "S" ((long)buf), "d" ((long)count)
+		: "rcx", "r11", "memory"
+	);
+	return ret;
+}
+#else
+/* 32-bit: does write syscall directly with int 0x80, saves ebx first then restores it */
 static int
 ae_write (int fd, void *buf, int count)
 {
@@ -25,15 +41,15 @@ ae_write (int fd, void *buf, int count)
 	}
 	return -1;
 }
+#endif
 
-// YAY IT FUCKING WORKS
-// this is our evil function that replaces printf or whatever
-// prints "I am evil!" instead of whatever the original function would print
+/* YAY IT FUCKING WORKS
+ * prints "I am evil!" instead of whatever the original function would print */
 int
 ae_evilprint (const char *format, ...)
 {
-	// allocate string on stack so it doesnt go in .rodata section
-	// build the message character by character because fuck string literals
+	/* allocate string on stack so it doesnt go in .rodata section
+	 * build the message character by character because string literals are boring */
 	char hijacked_msg[20];
 	hijacked_msg[0] = 'I';
 	hijacked_msg[1] = ' ';
@@ -50,13 +66,25 @@ ae_evilprint (const char *format, ...)
 
 	(void)format;
 
-	// dummy pointer injector looks for this 0x00000000 pattern
-	// we dont use it but injector patches it with original function address
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+	/* 64-bit: dummy pointer with 8-byte zero pattern
+	 * Injector looks for this movabs pattern and patches the 8-byte immediate
+	 * The movabs instruction will be: 48 b8 00 00 00 00 00 00 00 00 (movabs $0x0, %rax)
+	 * followed by mov to stack location */
+	volatile long origfunc_addr = 0x0000000000000000UL;
+	volatile int (*origfunc)(const char *format, ...) = (void*)origfunc_addr;
+	(void)origfunc;
+#else
+	/* 32-bit: dummy pointer injector looks for this 0x00000000 pattern
+	 * we dont use it but injector patches it with original function address */
 	volatile int (*origfunc)(const char *format, ...) = (void*)0x00000000;
 	(void)origfunc;
+#endif
 
-	// write the evil message to stdout using direct syscall
+	/* write the evil message to stdout using direct syscall */
 	ae_write(1, (char *)hijacked_msg, 11);
 	
 	return 0;
 }
+
+//jajjj hope u enjoy the project sorta stupid but works and it took time

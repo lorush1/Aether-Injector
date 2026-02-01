@@ -45,9 +45,12 @@ extract_hex_bytes() {
 }
 
 # why tf did i do this
-# same shit as above but only looks for the specific "c7 45 f4" instruction pattern (that mov thing) and extracts just that one line
+# same shit as above but only looks for the specific instruction pattern (that mov thing) and extracts just that one line
+# 32-bit pattern: "c7 45 f4" (mov dword [ebp-0xc], imm32)
+# 64-bit pattern: "48 c7 45" (mov qword [rbp-??], imm32) or "48 b8" (movabs rax, imm64)
 extract_tc_bytes() {
-	echo "$OBJDUMP_OUT" | \
+	# Try 32-bit pattern first
+	TC32=$(echo "$OBJDUMP_OUT" | \
 		sed -n "/<${FUNC}>:/,/^$/p" | \
 		grep "c7 45 f4" | \
 		head -n 1 | \
@@ -55,7 +58,41 @@ extract_tc_bytes() {
 		sed 's/[[:space:]][[:space:]].*$//' | \
 		tr '\n' ' ' | \
 		sed -E 's/([0-9a-fA-F]{2})/\\x\1/g' | \
-		sed -E 's/[[:space:]]//g'
+		sed -E 's/[[:space:]]//g')
+	
+	if [ -n "$TC32" ]; then
+		echo "$TC32"
+		return
+	fi
+	
+	# Try 64-bit pattern: mov qword [rbp-??], 0
+	TC64=$(echo "$OBJDUMP_OUT" | \
+		sed -n "/<${FUNC}>:/,/^$/p" | \
+		grep "48 c7 45" | \
+		head -n 1 | \
+		sed 's/^[[:space:]]*[0-9a-fA-F]*:[[:space:]]*//' | \
+		sed 's/[[:space:]][[:space:]].*$//' | \
+		tr '\n' ' ' | \
+		sed -E 's/([0-9a-fA-F]{2})/\\x\1/g' | \
+		sed -E 's/[[:space:]]//g')
+	
+	if [ -n "$TC64" ]; then
+		echo "$TC64"
+		return
+	fi
+	
+	# Try 64-bit movabs pattern: movabs $0x0, %rax
+	TC64_MOVABS=$(echo "$OBJDUMP_OUT" | \
+		sed -n "/<${FUNC}>:/,/^$/p" | \
+		grep "48 b8" | \
+		head -n 1 | \
+		sed 's/^[[:space:]]*[0-9a-fA-F]*:[[:space:]]*//' | \
+		sed 's/[[:space:]][[:space:]].*$//' | \
+		tr '\n' ' ' | \
+		sed -E 's/([0-9a-fA-F]{2})/\\x\1/g' | \
+		sed -E 's/[[:space:]]//g')
+	
+	echo "$TC64_MOVABS"
 }
 
 EVILSIG=$(extract_hex_bytes | cut -c1-$((4*$BYTECOUNT)))

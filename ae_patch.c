@@ -12,12 +12,21 @@
 #define PAGE_SIZE 4096
 #endif
 
+/* Architecture-specific syscall numbers */
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+#ifndef SYS_mmap
+#define SYS_mmap 9
+#endif
+#ifndef SYS_munmap
+#define SYS_munmap 11
+#endif
+#else /* 32-bit */
 #ifndef SYS_mmap
 #define SYS_mmap 90
 #endif
-
 #ifndef SYS_munmap
 #define SYS_munmap 91
+#endif
 #endif
 
 #define MAP_ANONYMOUS 0x20
@@ -64,6 +73,9 @@ static int ae_lde_decode_length(const uint8_t* code, size_t max_len, int* is_rel
     size_t pos = 0;
     int has_66 = 0;
     int has_67 = 0;
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    int has_rex_w = 0;
+#endif
     
     while (pos < max_len) {
         uint8_t b = code[pos];
@@ -82,6 +94,21 @@ static int ae_lde_decode_length(const uint8_t* code, size_t max_len, int* is_rel
             pos++;
             continue;
         }
+        
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        /* Handle 64-bit REX prefix (0x40-0x4F) */
+        if (b >= 0x40 && b <= 0x4F) {
+            if (b & 0x08) has_rex_w = 1;  /* REX.W bit */
+            pos++;
+            continue;
+        }
+        
+        /* 64-bit movabs rax/rbx/.., imm64 (0xB8-0xBF with REX.W = 10 bytes total) */
+        if (has_rex_w && (b >= 0xB8 && b <= 0xBF)) {
+            if (pos + 8 > max_len) return -1;
+            return pos + 1 + 8;  /* opcode + 8-byte immediate */
+        }
+#endif
         
         if (b >= 0x70 && b <= 0x7F) {
             if (pos + 2 > max_len) return -1;
@@ -146,9 +173,22 @@ static int ae_lde_decode_length(const uint8_t* code, size_t max_len, int* is_rel
             return pos + 2;
         }
         
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        /* On 64-bit, 0x40-0x4F are REX prefixes - continue to next byte */
+        if (b >= 0x40 && b <= 0x4F) {
+            pos++;
+            continue;
+        }
+        /* 64-bit push/pop are 0x50-0x5F */
+        if ((b & 0xF0) == 0x50) {
+            return pos + 1;
+        }
+#else
+        /* On 32-bit, 0x40-0x4F are INC/DEC and 0x50-0x5F are push/pop */
         if ((b & 0xF0) == 0x40 || (b & 0xF0) == 0x50) {
             return pos + 1;
         }
+#endif
         
         if (b == 0x90) {
             return pos + 1;

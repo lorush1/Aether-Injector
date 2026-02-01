@@ -15,12 +15,21 @@
 #define PAGE_SIZE 4096
 #endif
 
+/* Architecture-specific syscall numbers */
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+#ifndef SYS_mmap
+#define SYS_mmap 9
+#endif
+#ifndef SYS_munmap
+#define SYS_munmap 11
+#endif
+#else /* 32-bit */
 #ifndef SYS_mmap
 #define SYS_mmap 90
 #endif
-
 #ifndef SYS_munmap
 #define SYS_munmap 91
+#endif
 #endif
 
 struct ae_target {
@@ -164,6 +173,70 @@ static ae_addr_t ae_find_sysenter_simple(pid_t pid) {
     return 0;
 }
 
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+/* Find syscall instruction (0x0F 0x05) for 64-bit */
+static ae_addr_t ae_find_syscall_simple(pid_t pid) {
+    char maps_path[64];
+    FILE* maps_file;
+    char line[1024];
+    unsigned long start, end;
+    char perms[8];
+    
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    maps_file = fopen(maps_path, "r");
+    if (!maps_file) {
+        return 0;
+    }
+    
+    /* Search for syscall (0F 05) in vdso or libc */
+    const char* search_patterns[] = {"[vdso]", "libc", ""};
+    int num_patterns = sizeof(search_patterns) / sizeof(search_patterns[0]);
+    
+    for (int p = 0; p < num_patterns; p++) {
+        rewind(maps_file);
+        while (fgets(line, sizeof(line), maps_file)) {
+            if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) >= 3) {
+                if (strstr(perms, "x")) {
+                    int should_search = (search_patterns[p][0] == '\0') || 
+                                       (strstr(line, search_patterns[p]) != NULL);
+                    
+                    if (should_search) {
+                        unsigned long search_limit = (end - start > 0x100000) ? start + 0x100000 : end;
+                        uint8_t buf[1024];
+                        
+                        for (unsigned long addr = start; addr < search_limit; addr += sizeof(buf) - 1) {
+                            size_t read_size = (addr + sizeof(buf) < search_limit) ? sizeof(buf) : (search_limit - addr);
+                            if (read_size < 2) break;
+                            
+                            for (size_t i = 0; i < read_size; i++) {
+                                errno = 0;
+                                long val = ptrace(PTRACE_PEEKTEXT, pid, addr + i, NULL);
+                                if (val == -1 && errno != 0) {
+                                    buf[i] = 0;
+                                    break;
+                                }
+                                buf[i] = val & 0xFF;
+                            }
+                            
+                            for (size_t i = 0; i < read_size - 1; i++) {
+                                /* Look for syscall (0F 05) */
+                                if (buf[i] == 0x0F && buf[i + 1] == 0x05) {
+                                    fclose(maps_file);
+                                    return addr + i;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fclose(maps_file);
+    return 0;
+}
+#endif /* __x86_64__ */
+
 ae_status_t ae_target_create(ae_target_t* out_target, pid_t pid, ae_target_backend_t backend) {
     if (!out_target || pid <= 0) {
         return AE_ERROR_INVALID;
@@ -305,6 +378,25 @@ ae_status_t ae_target_get_regs(ae_target_t target, ae_target_regs_t* out_regs) {
         return AE_ERROR_IO;
     }
     
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    out_regs->rax = regs.rax;
+    out_regs->rbx = regs.rbx;
+    out_regs->rcx = regs.rcx;
+    out_regs->rdx = regs.rdx;
+    out_regs->rsi = regs.rsi;
+    out_regs->rdi = regs.rdi;
+    out_regs->rsp = regs.rsp;
+    out_regs->rbp = regs.rbp;
+    out_regs->r8 = regs.r8;
+    out_regs->r9 = regs.r9;
+    out_regs->r10 = regs.r10;
+    out_regs->r11 = regs.r11;
+    out_regs->r12 = regs.r12;
+    out_regs->r13 = regs.r13;
+    out_regs->r14 = regs.r14;
+    out_regs->r15 = regs.r15;
+    out_regs->rip = regs.rip;
+#else
     out_regs->eax = regs.eax;
     out_regs->ebx = regs.ebx;
     out_regs->ecx = regs.ecx;
@@ -314,6 +406,7 @@ ae_status_t ae_target_get_regs(ae_target_t target, ae_target_regs_t* out_regs) {
     out_regs->esp = regs.esp;
     out_regs->ebp = regs.ebp;
     out_regs->eip = regs.eip;
+#endif
     
     return AE_OK;
 }
@@ -328,6 +421,31 @@ ae_status_t ae_target_set_regs(ae_target_t target, const ae_target_regs_t* regs)
     }
     
     struct user_regs_struct ptrace_regs;
+    
+    /* First get current regs to preserve fields we don't set */
+    if (ptrace(PTRACE_GETREGS, target->pid, NULL, &ptrace_regs) == -1) {
+        return AE_ERROR_IO;
+    }
+    
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    ptrace_regs.rax = regs->rax;
+    ptrace_regs.rbx = regs->rbx;
+    ptrace_regs.rcx = regs->rcx;
+    ptrace_regs.rdx = regs->rdx;
+    ptrace_regs.rsi = regs->rsi;
+    ptrace_regs.rdi = regs->rdi;
+    ptrace_regs.rsp = regs->rsp;
+    ptrace_regs.rbp = regs->rbp;
+    ptrace_regs.r8 = regs->r8;
+    ptrace_regs.r9 = regs->r9;
+    ptrace_regs.r10 = regs->r10;
+    ptrace_regs.r11 = regs->r11;
+    ptrace_regs.r12 = regs->r12;
+    ptrace_regs.r13 = regs->r13;
+    ptrace_regs.r14 = regs->r14;
+    ptrace_regs.r15 = regs->r15;
+    ptrace_regs.rip = regs->rip;
+#else
     ptrace_regs.eax = regs->eax;
     ptrace_regs.ebx = regs->ebx;
     ptrace_regs.ecx = regs->ecx;
@@ -337,6 +455,7 @@ ae_status_t ae_target_set_regs(ae_target_t target, const ae_target_regs_t* regs)
     ptrace_regs.esp = regs->esp;
     ptrace_regs.ebp = regs->ebp;
     ptrace_regs.eip = regs->eip;
+#endif
     
     if (ptrace(PTRACE_SETREGS, target->pid, NULL, &ptrace_regs) == -1) {
         return AE_ERROR_IO;
@@ -345,17 +464,16 @@ ae_status_t ae_target_set_regs(ae_target_t target, const ae_target_regs_t* regs)
     return AE_OK;
 }
 
-static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* result, int use_int80, ae_addr_t syscall_addr) {
+static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, uintptr_t* result, int use_syscall_trace, ae_addr_t syscall_addr) {
     struct user_regs_struct regs;
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
         fprintf(stderr, "DEBUG: Failed to get regs at start of singlestep\n");
         return -1;
     }
     
-    // For int 0x80, use PTRACE_SYSCALL to properly trace the syscall
-    // This works even when EIP is manually set to int 0x80
-    if (use_int80) {
-        // Enable syscall tracing
+    /* For int 0x80 (32-bit) or syscall (64-bit), use PTRACE_SYSCALL to properly trace */
+    if (use_syscall_trace) {
+        /* Enable syscall tracing */
         if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == -1) {
             fprintf(stderr, "DEBUG: PTRACE_SYSCALL failed: %s\n", strerror(errno));
             return -1;
@@ -363,7 +481,7 @@ static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* 
         
         int status;
         
-        // Wait for syscall entry
+        /* Wait for syscall entry */
         if (waitpid(pid, &status, 0) == -1) {
             fprintf(stderr, "DEBUG: waitpid failed at entry: %s\n", strerror(errno));
             return -1;
@@ -374,13 +492,13 @@ static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* 
             return -1;
         }
         
-        // Continue to syscall exit
+        /* Continue to syscall exit */
         if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == -1) {
             fprintf(stderr, "DEBUG: PTRACE_SYSCALL failed at exit: %s\n", strerror(errno));
             return -1;
         }
         
-        // Wait for syscall exit
+        /* Wait for syscall exit */
         if (waitpid(pid, &status, 0) == -1) {
             fprintf(stderr, "DEBUG: waitpid failed at exit: %s\n", strerror(errno));
             return -1;
@@ -391,19 +509,25 @@ static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* 
             return -1;
         }
         
-        // Get the result
+        /* Get the result */
         if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
             fprintf(stderr, "DEBUG: Failed to get regs: %s\n", strerror(errno));
             return -1;
         }
         
-        *result = (unsigned int)regs.eax;
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        *result = (uintptr_t)regs.rax;
+        fprintf(stderr, "DEBUG: syscall completed, result=0x%lx (signed: %ld)\n", 
+               (unsigned long)*result, (long)*result);
+#else
+        *result = (uintptr_t)regs.eax;
         fprintf(stderr, "DEBUG: int 0x80 completed, result=0x%x (signed: %d)\n", 
-               *result, (int)(*result));
+               (unsigned int)*result, (int)*result);
+#endif
         return 0;
     }
     
-    // For sysenter: use single-stepping
+    /* For sysenter (32-bit only): use single-stepping */
     int syscall_started = 0;
     int steps = 0;
     int max_steps = 200;
@@ -420,7 +544,7 @@ static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* 
             return -1;
         }
         
-        // Check if process was killed
+        /* Check if process was killed */
         if (WIFSIGNALED(status)) {
             fprintf(stderr, "DEBUG: Process killed with signal %d\n", WTERMSIG(status));
             return -1;
@@ -433,27 +557,46 @@ static int ae_singlestep_syscall(pid_t pid, uint32_t syscall_num, unsigned int* 
         
         steps++;
         
-        // For sysenter wrapper: detect completion by EAX changing from syscall number
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        /* 64-bit: detect completion by RAX changing from syscall number */
         if (!syscall_started) {
-            // Wait for syscall to start (EAX should be syscall_num when at sysenter)
-            if ((unsigned int)regs.eax == syscall_num) {
+            if ((uintptr_t)regs.rax == syscall_num) {
                 syscall_started = 1;
-                fprintf(stderr, "DEBUG: Syscall started at step %d, EAX=0x%x\n", i, regs.eax);
+                fprintf(stderr, "DEBUG: Syscall started at step %d, RAX=0x%lx\n", i, (unsigned long)regs.rax);
             }
         } else {
-            // After syscall completes, EAX will contain the result
-            // Continue stepping until EAX changes (syscall completed)
-            if ((unsigned int)regs.eax != syscall_num) {
-                *result = (unsigned int)regs.eax;
-                fprintf(stderr, "DEBUG: Syscall completed at step %d, result=0x%x (signed: %d)\n", 
-                       i, *result, (int)(*result));
+            if ((uintptr_t)regs.rax != syscall_num) {
+                *result = (uintptr_t)regs.rax;
+                fprintf(stderr, "DEBUG: Syscall completed at step %d, result=0x%lx (signed: %ld)\n", 
+                       i, (unsigned long)*result, (long)*result);
                 return 0;
             }
         }
+#else
+        /* 32-bit: detect completion by EAX changing from syscall number */
+        if (!syscall_started) {
+            if ((unsigned int)regs.eax == syscall_num) {
+                syscall_started = 1;
+                fprintf(stderr, "DEBUG: Syscall started at step %d, EAX=0x%lx\n", i, (unsigned long)regs.eax);
+            }
+        } else {
+            if ((unsigned int)regs.eax != syscall_num) {
+                *result = (uintptr_t)regs.eax;
+                fprintf(stderr, "DEBUG: Syscall completed at step %d, result=0x%x (signed: %d)\n", 
+                       i, (unsigned int)*result, (int)*result);
+                return 0;
+            }
+        }
+#endif
     }
     
-    fprintf(stderr, "DEBUG: Syscall stepping timed out after %d steps, EAX=0x%x, EIP=0x%x\n", 
-           steps, regs.eax, regs.eip);
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    fprintf(stderr, "DEBUG: Syscall stepping timed out after %d steps, RAX=0x%lx, RIP=0x%lx\n", 
+           steps, (unsigned long)regs.rax, (unsigned long)regs.rip);
+#else
+    fprintf(stderr, "DEBUG: Syscall stepping timed out after %d steps, EAX=0x%lx, EIP=0x%lx\n", 
+           steps, (unsigned long)regs.eax, (unsigned long)regs.eip);
+#endif
     return -1;
 }
 
@@ -493,22 +636,30 @@ static ae_status_t ae_find_executable_memory(pid_t pid, ae_addr_t* out_addr) {
     return AE_ERROR_UNSUPPORTED;
 }
 
-// Inject a syscall stub into target process memory
+/* Inject a syscall stub into target process memory */
 static ae_status_t ae_inject_syscall_stub(ae_target_t target, ae_addr_t* out_stub_addr) {
-    // Find executable memory region
+    /* Find executable memory region */
     ae_addr_t stub_addr = 0;
     if (ae_find_executable_memory(target->pid, &stub_addr) != AE_OK) {
-        // Fallback: use stack if we can't find executable memory
+        /* Fallback: use stack if we can't find executable memory */
         struct user_regs_struct regs;
         if (ptrace(PTRACE_GETREGS, target->pid, NULL, &regs) == -1) {
             return AE_ERROR_IO;
         }
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+        stub_addr = regs.rsp - 16;
+#else
         stub_addr = regs.esp - 16;
+#endif
     }
     
-    // Syscall stub: int 0x80; int3 (CD 80 CC)
-    // We use int3 as a breakpoint to catch when syscall returns
-    uint8_t stub_code[] = {0xCD, 0x80, 0xCC};  // int 0x80; int3 (breakpoint)
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    /* 64-bit syscall stub: syscall; int3 (0F 05 CC) */
+    uint8_t stub_code[] = {0x0F, 0x05, 0xCC};  /* syscall; int3 (breakpoint) */
+#else
+    /* 32-bit syscall stub: int 0x80; int3 (CD 80 CC) */
+    uint8_t stub_code[] = {0xCD, 0x80, 0xCC};  /* int 0x80; int3 (breakpoint) */
+#endif
     
     // Save original bytes for restoration
     long saved_bytes[4] = {0};
@@ -560,12 +711,36 @@ ae_status_t ae_target_exec_syscall(ae_target_t target, uint32_t syscall_num, uin
     
     struct user_regs_struct saved_regs = regs;
     
-    // Try to find int 0x80 first (simpler, more reliable)
-    ae_addr_t syscall_addr = ae_find_int80_simple(target->pid);
-    int use_int80 = (syscall_addr != 0);
+#if defined(__x86_64__) || (defined(__WORDSIZE) && __WORDSIZE == 64)
+    /* 64-bit: find syscall instruction (0F 05) */
+    ae_addr_t syscall_addr = ae_find_syscall_simple(target->pid);
+    int use_syscall_trace = 1;  /* Always use PTRACE_SYSCALL for 64-bit syscall */
     
-    // Fall back to sysenter wrapper if int 0x80 not found
-    if (!use_int80) {
+    if (syscall_addr == 0) {
+        fprintf(stderr, "DEBUG: Failed to find syscall instruction in target process %d\n", target->pid);
+        return AE_ERROR_UNSUPPORTED;
+    }
+    fprintf(stderr, "DEBUG: Found syscall at 0x%lx (using syscall instruction)\n", (unsigned long)syscall_addr);
+    
+    /* 64-bit syscall convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4, r8=arg5, r9=arg6 */
+    regs.rax = syscall_num;
+    regs.rdi = arg1;
+    regs.rsi = arg2;
+    regs.rdx = arg3;
+    regs.r10 = arg4;
+    regs.r8 = arg5;
+    regs.r9 = arg6;
+    regs.rip = syscall_addr;
+    
+    fprintf(stderr, "DEBUG: Setting up syscall: num=%u, args=(0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx), RSP=0x%lx\n",
+           syscall_num, arg1, arg2, arg3, arg4, arg5, arg6, (unsigned long)regs.rsp);
+#else
+    /* 32-bit: try to find int 0x80 first (simpler, more reliable) */
+    ae_addr_t syscall_addr = ae_find_int80_simple(target->pid);
+    int use_syscall_trace = (syscall_addr != 0);
+    
+    /* Fall back to sysenter wrapper if int 0x80 not found */
+    if (!use_syscall_trace) {
         syscall_addr = ae_find_sysenter_simple(target->pid);
         if (syscall_addr == 0) {
             fprintf(stderr, "DEBUG: Failed to find syscall instruction in target process %d\n", target->pid);
@@ -576,7 +751,7 @@ ae_status_t ae_target_exec_syscall(ae_target_t target, uint32_t syscall_num, uin
         fprintf(stderr, "DEBUG: Found int 0x80 at 0x%lx (using int 0x80)\n", (unsigned long)syscall_addr);
     }
     
-    // Set up registers for syscall
+    /* 32-bit syscall convention: eax=num, ebx=arg1, ecx=arg2, edx=arg3, esi=arg4, edi=arg5, ebp=arg6 */
     regs.eax = syscall_num;
     regs.ebx = arg1;
     regs.ecx = arg2;
@@ -584,32 +759,31 @@ ae_status_t ae_target_exec_syscall(ae_target_t target, uint32_t syscall_num, uin
     regs.esi = arg4;
     regs.edi = arg5;
     regs.ebp = arg6;
-    regs.eip = syscall_addr;  // Jump to syscall instruction
+    regs.eip = syscall_addr;
     
     fprintf(stderr, "DEBUG: Setting up syscall: num=%u, args=(0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx), ESP=0x%lx\n",
            syscall_num, arg1, arg2, arg3, arg4, arg5, arg6, (unsigned long)regs.esp);
+#endif
     
     if (ptrace(PTRACE_SETREGS, target->pid, NULL, &regs) == -1) {
         fprintf(stderr, "DEBUG: Failed to set regs: %s\n", strerror(errno));
         return AE_ERROR_IO;
     }
     
-    // Execute syscall
-    unsigned int result = 0;
-    if (ae_singlestep_syscall(target->pid, syscall_num, &result, use_int80, syscall_addr) != 0) {
+    /* Execute syscall */
+    uintptr_t result = 0;
+    if (ae_singlestep_syscall(target->pid, syscall_num, &result, use_syscall_trace, syscall_addr) != 0) {
         fprintf(stderr, "DEBUG: Syscall execution failed\n");
         ptrace(PTRACE_SETREGS, target->pid, NULL, &saved_regs);
         return AE_ERROR_IO;
     }
     
-    // On x86-32 Linux, syscalls return negative values for errors
-    // Error codes are typically in range -1 to -4095
-    // Positive values (or values > 0xfffff000) are success
+    /* On Linux, syscalls return negative values for errors (range -1 to -4095) */
     int is_error = ((long)result < 0 && (long)result >= -4095);
     
     if (is_error) {
-        fprintf(stderr, "DEBUG: Syscall returned error: 0x%x (signed: %d, errno: %d)\n", 
-               (unsigned int)result, (int)result, (int)-result);
+        fprintf(stderr, "DEBUG: Syscall returned error: 0x%lx (signed: %ld, errno: %ld)\n", 
+               (unsigned long)result, (long)result, (long)-result);
     } else {
         fprintf(stderr, "DEBUG: Syscall returned success value: 0x%lx\n", (unsigned long)result);
     }

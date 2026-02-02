@@ -77,3 +77,5 @@ you need the parasite lib and (if using signature-based hook discovery) the gene
 ---
 
 full design, tradeoffs, failure modes, and detection surface: **[DOCUMENTATION.md](DOCUMENTATION.md)**
+
+-creds: lorush1
